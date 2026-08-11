@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -1018,6 +1019,393 @@ def calcular_indicadores(conciliacao: pd.DataFrame) -> dict:
 
 
 
+def limpar_telefone(valor) -> str:
+    numeros = re.sub(r"\D", "", texto_limpo(valor))
+
+    if numeros.startswith("0") and len(numeros) > 10:
+        numeros = numeros[1:]
+
+    if numeros and not numeros.startswith("55"):
+        numeros = f"55{numeros}"
+
+    return numeros
+
+def carregar_resposta_mais_recente_follow(follow_id: int) -> dict:
+    cliente = exigir_supabase()
+
+    resposta = (
+        cliente.table("follow_respostas")
+        .select("*")
+        .eq("follow_id", follow_id)
+        .order("respondido_em", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not resposta.data:
+        return {}
+
+    return resposta.data[0]
+
+
+# =========================================================
+# FOLLOW INTEGRADO AO PORTAL DA OFICINA
+# =========================================================
+
+MOTIVOS_IMPEDIMENTO_PORTAL = [
+    "Veículo indisponível",
+    "Cliente solicitou alteração da data",
+    "Falta de equipamento ou ferramenta",
+    "Falta de peça ou insumo",
+    "Problema técnico sem solução",
+    "Técnico/equipe indisponível",
+    "Oficina sem capacidade para a data",
+    "Dificuldade de acesso ou deslocamento",
+    "Dados/OS insuficientes para executar",
+    "Outro",
+]
+
+
+def buscar_follow_pendentes_portal() -> pd.DataFrame:
+    registros = buscar_todos(
+        "follow_contatos",
+        ordem="data_manutencao",
+        desc=False,
+    )
+
+    if not registros:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(registros)
+
+    if df.empty or "oficina" not in df.columns:
+        return pd.DataFrame()
+
+    df["oficina_norm"] = (
+        df["oficina"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    return df[
+        df["oficina_norm"] == OFICINA_PORTAL.upper()
+    ].copy()
+
+
+def carregar_resposta_follow_portal(follow_id: int) -> dict:
+    resposta = (
+        cliente.table("follow_respostas")
+        .select("*")
+        .eq("follow_id", follow_id)
+        .order("respondido_em", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not resposta.data:
+        return {}
+
+    return resposta.data[0]
+
+
+def enviar_resposta_follow_portal(
+    follow: dict,
+    nome_respondente: str,
+    equipamentos: str,
+    veiculo: str,
+    capacidade: str,
+    tem_impedimento: bool,
+    motivos: list[str],
+    os_afetadas: list[str],
+    observacao: str,
+    previsao: str,
+) -> None:
+    agora = datetime.now().astimezone().isoformat()
+
+    cliente.table("follow_respostas").insert(
+        {
+            "follow_id": int(follow["id"]),
+            "token": str(follow["token"]),
+            "nome_respondente": nome_respondente,
+            "equipamentos_ok": equipamentos == "Sim",
+            "veiculo_disponivel": veiculo,
+            "capacidade_ok": capacidade == "Sim",
+            "tem_impedimento": tem_impedimento,
+            "motivos": motivos,
+            "os_afetadas": os_afetadas,
+            "observacao": observacao,
+            "previsao_solucao": previsao,
+            "respondido_em": agora,
+        }
+    ).execute()
+
+    cliente.table("follow_contatos").update(
+        {
+            "status": "Respondido",
+            "respondido_em": agora,
+            "tem_impedimento": tem_impedimento,
+            "status_resposta": (
+                "Com impedimento"
+                if tem_impedimento
+                else "Sem impedimento"
+            ),
+            "ultima_atualizacao": agora,
+        }
+    ).eq(
+        "id",
+        int(follow["id"]),
+    ).execute()
+
+
+def exibir_follow_portal() -> None:
+    st.markdown("### 📞 Follow de Manutenções")
+    st.caption(
+        "Confirme as manutenções agendadas e informe antecipadamente "
+        "qualquer impedimento."
+    )
+
+    follows = buscar_follow_pendentes_portal()
+
+    if follows.empty:
+        st.success("Você não possui Follow disponível no momento.")
+        return
+
+    hoje = date.today()
+
+    follows["data_dt"] = pd.to_datetime(
+        follows["data_manutencao"],
+        errors="coerce",
+    ).dt.date
+
+    pendentes = follows[
+        follows["data_dt"].notna()
+        & (follows["data_dt"] >= hoje - timedelta(days=1))
+    ].copy()
+
+    if pendentes.empty:
+        st.info("Não há Follow pendente para datas atuais ou futuras.")
+    else:
+        st.markdown("#### Pendências para confirmação")
+
+        for _, row in pendentes.sort_values("data_dt").iterrows():
+            follow = row.to_dict()
+            data_txt = pd.to_datetime(
+                follow["data_manutencao"]
+            ).strftime("%d/%m/%Y")
+            qtd = int(follow.get("qtd_agendadas") or 0)
+
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([2, 1, 1])
+                c1.markdown(f"#### {data_txt}")
+                c1.caption(
+                    f"{qtd} manutenção(ões) prevista(s)"
+                )
+                c2.metric(
+                    "Status",
+                    str(follow.get("status") or "Preparado"),
+                )
+                c3.metric(
+                    "Resposta",
+                    str(
+                        follow.get("status_resposta")
+                        or "Pendente"
+                    ),
+                )
+
+                os_lista = [
+                    str(x)
+                    for x in (follow.get("os_agendadas") or [])
+                    if str(x).strip()
+                ]
+
+                if os_lista:
+                    st.caption(
+                        "OS previstas: "
+                        + ", ".join(os_lista[:20])
+                    )
+
+                if bool(follow.get("respondido_em")):
+                    resposta = carregar_resposta_follow_portal(
+                        int(follow["id"])
+                    )
+
+                    if bool(follow.get("tem_impedimento")):
+                        st.warning(
+                            "⚠️ Follow respondido com impedimento."
+                        )
+                    else:
+                        st.success(
+                            "✅ Follow respondido sem impedimento."
+                        )
+
+                    if resposta:
+                        nome = str(
+                            resposta.get("nome_respondente") or ""
+                        )
+                        motivos = resposta.get("motivos") or []
+                        observacao = str(
+                            resposta.get("observacao") or ""
+                        )
+
+                        if nome:
+                            st.write(
+                                f"**Respondente:** {nome}"
+                            )
+                        if motivos:
+                            st.write(
+                                "**Motivos:** "
+                                + " | ".join(map(str, motivos))
+                            )
+                        if observacao:
+                            st.write(
+                                f"**Observação:** {observacao}"
+                            )
+                    continue
+
+                with st.form(
+                    f"follow_portal_{int(follow['id'])}"
+                ):
+                    nome = st.text_input(
+                        "Seu nome",
+                        key=f"nome_{follow['id']}",
+                    )
+
+                    equipamentos = st.radio(
+                        "Todos os equipamentos/ferramentas estão disponíveis?",
+                        ["Sim", "Não"],
+                        horizontal=True,
+                        key=f"equip_{follow['id']}",
+                    )
+
+                    veiculo = st.radio(
+                        "O(s) veículo(s) estará(ão) disponível(is)?",
+                        ["Sim", "Não", "Não sei"],
+                        horizontal=True,
+                        key=f"veic_{follow['id']}",
+                    )
+
+                    capacidade = st.radio(
+                        "A oficina possui técnico/capacidade para atender?",
+                        ["Sim", "Não"],
+                        horizontal=True,
+                        key=f"cap_{follow['id']}",
+                    )
+
+                    impedimento = st.radio(
+                        "Existe algum impedimento para a execução?",
+                        [
+                            "Não, está tudo OK",
+                            "Sim, existe impedimento",
+                        ],
+                        key=f"imp_{follow['id']}",
+                    )
+
+                    tem_impedimento = (
+                        impedimento == "Sim, existe impedimento"
+                    )
+
+                    motivos = []
+                    os_afetadas = []
+                    observacao = ""
+                    previsao = ""
+
+                    if tem_impedimento:
+                        motivos = st.multiselect(
+                            "Qual(is) o(s) impedimento(s)?",
+                            MOTIVOS_IMPEDIMENTO_PORTAL,
+                            key=f"motivos_{follow['id']}",
+                        )
+
+                        if os_lista:
+                            os_afetadas = st.multiselect(
+                                "Quais OS podem ser afetadas?",
+                                os_lista,
+                                key=f"osafet_{follow['id']}",
+                            )
+
+                        observacao = st.text_area(
+                            "Explique o impedimento",
+                            key=f"obs_{follow['id']}",
+                        )
+
+                        previsao = st.text_input(
+                            "Previsão de solução (opcional)",
+                            key=f"prev_{follow['id']}",
+                        )
+                    else:
+                        observacao = st.text_area(
+                            "Observação (opcional)",
+                            key=f"obsok_{follow['id']}",
+                        )
+
+                    enviar = st.form_submit_button(
+                        "Enviar confirmação",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if enviar:
+                    if not nome.strip():
+                        st.error("Informe seu nome.")
+                        return
+
+                    if tem_impedimento and not motivos:
+                        st.error(
+                            "Selecione ao menos um motivo."
+                        )
+                        return
+
+                    enviar_resposta_follow_portal(
+                        follow=follow,
+                        nome_respondente=nome,
+                        equipamentos=equipamentos,
+                        veiculo=veiculo,
+                        capacidade=capacidade,
+                        tem_impedimento=tem_impedimento,
+                        motivos=motivos,
+                        os_afetadas=os_afetadas,
+                        observacao=observacao,
+                        previsao=previsao,
+                    )
+
+                    st.success(
+                        "Resposta enviada para a gestão."
+                    )
+                    st.rerun()
+
+    st.divider()
+    st.markdown("#### Histórico recente")
+
+    historico = follows[
+        follows["respondido_em"].notna()
+    ].copy()
+
+    if historico.empty:
+        st.caption("Nenhuma resposta registrada ainda.")
+    else:
+        cols = [
+            c
+            for c in [
+                "data_manutencao",
+                "qtd_agendadas",
+                "status_resposta",
+                "respondido_em",
+            ]
+            if c in historico.columns
+        ]
+
+        st.dataframe(
+            historico[cols].sort_values(
+                "data_manutencao",
+                ascending=False,
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 # =========================================================
 # PORTAL YESHUA — MVP 1.0 (SOMENTE LEITURA)
 # =========================================================
@@ -1070,7 +1458,7 @@ with st.sidebar:
     st.caption("Oficina vinculada")
     st.success(OFICINA_PORTAL)
     st.divider()
-    st.caption("Portal da Oficina • MVP 1.0.4")
+    st.caption("Portal da Oficina • MVP 1.1.0")
 
 if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
     inicio, fim = periodo
@@ -1154,11 +1542,12 @@ st.caption(
 
 st.divider()
 
-aba_resumo, aba_improd, aba_noshow, aba_os = st.tabs([
+aba_resumo, aba_improd, aba_noshow, aba_os, aba_follow = st.tabs([
     "📈 Desempenho",
     "🔴 Improdutivas",
     "🚫 No-show",
     "🔎 Minhas OS",
+    "📞 Follow",
 ])
 
 with aba_resumo:
@@ -1269,8 +1658,11 @@ with aba_os:
         height=560,
     )
 
+with aba_follow:
+    exibir_follow_portal()
+
 st.divider()
 st.caption(
     "Piloto YESHUA RASTREAMENTO • Dados provenientes da base operacional PS. "
-    "Portal somente leitura."
+    "Portal com Follow integrado."
 )
