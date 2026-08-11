@@ -900,6 +900,124 @@ def texto_limpo(valor) -> str:
     return texto
 
 
+def calcular_indicadores(conciliacao: pd.DataFrame) -> dict:
+    agendadas_validas = {
+        "Executada agendada",
+        "Improdutiva agendada",
+        "Cancelada",
+        "No-show",
+        "Status intermediário agendado",
+    }
+
+    manutencoes_agendadas = int(
+        conciliacao["Classificação"].isin(
+            agendadas_validas
+        ).sum()
+    )
+
+    agendadas_executadas = int(
+        (
+            conciliacao["Classificação"]
+            == "Executada agendada"
+        ).sum()
+    )
+
+    executadas_extras = int(
+        (
+            conciliacao["Classificação"]
+            == "Executada extra"
+        ).sum()
+    )
+
+    improdutivas_agendadas = int(
+        (
+            conciliacao["Classificação"]
+            == "Improdutiva agendada"
+        ).sum()
+    )
+
+    improdutivas_extras = int(
+        (
+            conciliacao["Classificação"]
+            == "Improdutiva extra"
+        ).sum()
+    )
+
+    improdutivas = (
+        improdutivas_agendadas
+        + improdutivas_extras
+    )
+
+    canceladas = int(
+        (conciliacao["Classificação"] == "Cancelada").sum()
+    )
+
+    no_show = int(
+        (conciliacao["Classificação"] == "No-show").sum()
+    )
+
+    mci = (
+        agendadas_executadas
+        / manutencoes_agendadas
+        * 100
+        if manutencoes_agendadas
+        else 0.0
+    )
+
+    base_md = (
+        agendadas_executadas
+        + executadas_extras
+        + improdutivas
+    )
+
+    md = (
+        improdutivas / base_md * 100
+        if base_md
+        else 0.0
+    )
+
+    return {
+        "Planejadas": manutencoes_agendadas,
+        "Executadas planejadas": agendadas_executadas,
+        "Improdutivas": improdutivas,
+        "Improdutivas agendadas": improdutivas_agendadas,
+        "Improdutivas extras": improdutivas_extras,
+        "Canceladas": canceladas,
+        "No-show": no_show,
+        "Possíveis substituições de OS": int(
+            (
+                conciliacao["Classificação"]
+                == "Possível substituição de OS"
+            ).sum()
+        ),
+        "Executadas extras": executadas_extras,
+        "MCI": mci,
+        "MD": md,
+        "Índice no-show": (
+            no_show / manutencoes_agendadas * 100
+            if manutencoes_agendadas
+            else 0.0
+        ),
+        "Índice cancelamento": (
+            canceladas / manutencoes_agendadas * 100
+            if manutencoes_agendadas
+            else 0.0
+        ),
+        "Execução total": (
+            (
+                agendadas_executadas
+                + executadas_extras
+            )
+            / manutencoes_agendadas
+            * 100
+            if manutencoes_agendadas
+            else 0.0
+        ),
+    }
+
+
+
+
 # =========================================================
 # PORTAL YESHUA — MVP 1.0 (SOMENTE LEITURA)
 # =========================================================
@@ -952,7 +1070,7 @@ with st.sidebar:
     st.caption("Oficina vinculada")
     st.success(OFICINA_PORTAL)
     st.divider()
-    st.caption("Portal da Oficina • MVP 1.0.2")
+    st.caption("Portal da Oficina • MVP 1.0.3")
 
 if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
     inicio, fim = periodo
@@ -995,48 +1113,41 @@ if dados.empty:
     )
     st.stop()
 
-# Uma linha consolidada representa o atendimento operacional já classificado
-# pelo mesmo motor do painel interno.
-classes = dados["Classificação"].fillna("").astype(str)
+# Usa exatamente o mesmo cálculo do painel interno.
+indicadores = calcular_indicadores(dados)
 
-agendadas = int(
-    classes.isin([
-        "Executada agendada",
-        "Improdutiva agendada",
-        "Cancelada",
-        "No-show",
-        "Possível substituição de OS",
-    ]).sum()
-)
-executadas_ag = int((classes == "Executada agendada").sum())
-executadas_extra = int((classes == "Executada extra").sum())
+agendadas = indicadores["Planejadas"]
+executadas_ag = indicadores["Executadas planejadas"]
+executadas_extra = indicadores["Executadas extras"]
 executadas = executadas_ag + executadas_extra
-
-improd_ag = int((classes == "Improdutiva agendada").sum())
-improd_extra = int((classes == "Improdutiva extra").sum())
-improdutivas = improd_ag + improd_extra
-
-no_show = int((classes == "No-show").sum())
-canceladas = int(classes.isin(["Cancelada", "Cancelada extra", "Cancelada no agendamento"]).sum())
-
-# Mesmas leituras operacionais usadas no painel: MCI sobre planejadas;
-# MD de improdutividade sobre execuções/desfechos de campo.
-mci = (executadas_ag / agendadas * 100) if agendadas else 0.0
-base_md = executadas + improdutivas
-md = (improdutivas / base_md * 100) if base_md else 0.0
+improdutivas = indicadores["Improdutivas"]
+improd_ag = indicadores["Improdutivas agendadas"]
+improd_extra = indicadores["Improdutivas extras"]
+no_show = indicadores["No-show"]
+canceladas = indicadores["Canceladas"]
+mci = indicadores["MCI"]
+md = indicadores["MD"]
+substituicoes = indicadores["Possíveis substituições de OS"]
 
 st.subheader(f"Visão do período • {inicio.strftime('%d/%m/%Y')} a {fim.strftime('%d/%m/%Y')}")
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Planejadas", agendadas)
-c2.metric("Executadas", executadas)
-c3.metric("Improdutivas", improdutivas)
-c4.metric("No-show", no_show)
+c1.metric("Manutenções agendadas", agendadas)
+c2.metric("Agendadas executadas", executadas_ag)
+c3.metric("Executadas extras", executadas_extra)
+c4.metric("Improdutivas", improdutivas)
 
-c5, c6, c7 = st.columns(3)
-c5.metric("Canceladas", canceladas)
-c6.metric("MCI", f"{mci:.1f}%")
-c7.metric("MD • Improdutividade", f"{md:.1f}%")
+c5, c6, c7, c8 = st.columns(4)
+c5.metric("No-show", no_show)
+c6.metric("Canceladas", canceladas)
+c7.metric("MCI", f"{mci:.1f}%")
+c8.metric("MD • Improdutividade", f"{md:.1f}%")
+
+st.caption(
+    f"Execuções totais no período: **{executadas}** "
+    f"({executadas_ag} agendadas + {executadas_extra} extras). "
+    f"Possíveis substituições de OS: **{substituicoes}**."
+)
 
 st.divider()
 
