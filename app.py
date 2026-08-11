@@ -16,13 +16,23 @@ CACHE_TTL_SEGUNDOS = 60
 def obter_cliente_supabase():
     try:
         url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
+
+        # Usa o mesmo padrão do painel principal.
+        if "SUPABASE_SERVICE_KEY" in st.secrets:
+            key = st.secrets["SUPABASE_SERVICE_KEY"]
+        elif "SUPABASE_KEY" in st.secrets:
+            key = st.secrets["SUPABASE_KEY"]
+        else:
+            raise KeyError("Chave do Supabase não encontrada.")
+
     except Exception:
         st.error(
             "O portal ainda não está conectado ao Supabase. "
-            "Configure SUPABASE_URL e SUPABASE_KEY nos Secrets do Streamlit."
+            "Configure SUPABASE_URL e SUPABASE_SERVICE_KEY "
+            "(ou SUPABASE_KEY) nos Secrets do Streamlit."
         )
         st.stop()
+
     return create_client(url, key)
 
 cliente = obter_cliente_supabase()
@@ -937,7 +947,7 @@ with st.sidebar:
     st.caption("Oficina vinculada")
     st.success(OFICINA_PORTAL)
     st.divider()
-    st.caption("Portal da Oficina • MVP 1.0")
+    st.caption("Portal da Oficina • MVP 1.0.1")
 
 if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
     inicio, fim = periodo
