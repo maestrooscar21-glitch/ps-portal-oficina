@@ -1070,7 +1070,7 @@ with st.sidebar:
     st.caption("Oficina vinculada")
     st.success(OFICINA_PORTAL)
     st.divider()
-    st.caption("Portal da Oficina • MVP 1.0.3")
+    st.caption("Portal da Oficina • MVP 1.0.4")
 
 if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
     inicio, fim = periodo
@@ -1105,6 +1105,9 @@ dados = consolidado[
     consolidado[col_oficina].fillna("").astype(str).str.strip().str.upper()
     == OFICINA_PORTAL.upper()
 ].copy()
+
+# Série de classificações usada nas análises e abas do portal.
+classes = dados["Classificação"].fillna("").astype(str)
 
 if dados.empty:
     st.warning(
