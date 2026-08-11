@@ -37,6 +37,11 @@ def obter_cliente_supabase():
 
 cliente = obter_cliente_supabase()
 
+# Compatibilidade com o motor reaproveitado do painel principal.
+# Algumas funções internas usam os nomes SUPABASE / ERRO_SUPABASE.
+SUPABASE = cliente
+ERRO_SUPABASE = None
+
 def buscar_todos(tabela: str, ordem: str | None = None, desc: bool = False):
     consulta = cliente.table(tabela).select("*")
     if ordem:
@@ -947,7 +952,7 @@ with st.sidebar:
     st.caption("Oficina vinculada")
     st.success(OFICINA_PORTAL)
     st.divider()
-    st.caption("Portal da Oficina • MVP 1.0.1")
+    st.caption("Portal da Oficina • MVP 1.0.2")
 
 if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
     inicio, fim = periodo
