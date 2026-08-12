@@ -2785,6 +2785,116 @@ def carregar_planejamento_futuro_portal() -> pd.DataFrame:
 
 
 
+
+# =========================================================
+# DETALHAMENTO CLICÁVEL DOS INDICADORES DO PORTAL
+# =========================================================
+
+def definir_detalhe_portal(filtro: str) -> None:
+    st.session_state["portal_detalhe_ativo"] = filtro
+
+
+def limpar_detalhe_portal() -> None:
+    st.session_state["portal_detalhe_ativo"] = None
+
+
+def filtrar_detalhe_portal(base: pd.DataFrame, filtro: str) -> pd.DataFrame:
+    classes = base["Classificação"].fillna("").astype(str)
+
+    mapa = {
+        "Planejados": [
+            "Executada agendada",
+            "Improdutiva agendada",
+            "Cancelada",
+            "No-show",
+            "Status intermediário agendado",
+        ],
+        "Executados": [
+            "Executada agendada",
+            "Executada extra",
+        ],
+        "Não concluídos": [
+            "Improdutiva agendada",
+            "Improdutiva extra",
+        ],
+        "No-show": ["No-show"],
+        "Cancelados": ["Cancelada"],
+        "Execuções extras": ["Executada extra"],
+    }
+
+    classes_filtro = mapa.get(filtro, [])
+    return base[classes.isin(classes_filtro)].copy()
+
+
+def exibir_card_portal(coluna, titulo: str, valor, filtro: str | None = None) -> None:
+    coluna.metric(titulo, valor)
+
+    if filtro:
+        coluna.button(
+            "🔎 Ver OS",
+            key="portal_ver_" + normalizar_texto(filtro).lower().replace(" ", "_"),
+            on_click=definir_detalhe_portal,
+            args=(filtro,),
+            use_container_width=True,
+        )
+
+
+def exibir_detalhe_portal(base: pd.DataFrame) -> None:
+    filtro = st.session_state.get("portal_detalhe_ativo")
+    if not filtro:
+        return
+
+    detalhe = filtrar_detalhe_portal(base, filtro)
+
+    st.markdown("---")
+    st.subheader(f"🔎 Conferência das OS — {filtro}")
+    st.caption(
+        f"Foram encontrados {len(detalhe)} atendimento(s) "
+        "da oficina no período selecionado."
+    )
+
+    colunas = [
+        "Data Operacional",
+        "Tipo de Serviço",
+        "Classificação",
+        "Ticket",
+        "Placa",
+        "OS_planejada",
+        "OS_resultado",
+        "Status_planejado",
+        "Status_resultado",
+        "Razao_improdutiva",
+        "Observacao_tecnico_improdutiva",
+        "Motivo da Classificação",
+    ]
+    colunas = [c for c in colunas if c in detalhe.columns]
+
+    exibicao = detalhe[colunas].copy().rename(
+        columns={
+            "OS_planejada": "OS planejada",
+            "OS_resultado": "OS resultado",
+            "Status_planejado": "Status planejado",
+            "Status_resultado": "Status resultado",
+            "Razao_improdutiva": "Razão da Improdutiva",
+            "Observacao_tecnico_improdutiva": "Observação do Técnico",
+        }
+    )
+
+    st.dataframe(
+        exibicao,
+        use_container_width=True,
+        hide_index=True,
+        height=500,
+    )
+
+    if st.button(
+        "✖ Fechar",
+        key="portal_fechar_detalhe",
+    ):
+        limpar_detalhe_portal()
+        st.rerun()
+
+
 # =========================================================
 # PORTAL YESHUA — MVP 1.0 (SOMENTE LEITURA)
 # =========================================================
@@ -2858,7 +2968,7 @@ with st.sidebar:
     st.caption("Oficina vinculada")
     st.success(OFICINA_PORTAL)
     st.divider()
-    st.caption("Portal da Oficina • MVP 1.3.0")
+    st.caption("Portal da Oficina • MVP 1.3.1")
 
 if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
     inicio, fim = periodo
@@ -2936,40 +3046,18 @@ st.caption(
 )
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric(
-    "Serviços planejados",
-    planejadas,
-)
-c2.metric(
-    "Executados",
-    executadas,
-)
-c3.metric(
-    "Não concluídos",
-    improdutivas,
-)
-c4.metric(
-    "No-show",
-    no_show,
-)
+
+exibir_card_portal(c1, "Serviços planejados", planejadas, "Planejados")
+exibir_card_portal(c2, "Executados", executadas, "Executados")
+exibir_card_portal(c3, "Não concluídos", improdutivas, "Não concluídos")
+exibir_card_portal(c4, "No-show", no_show, "No-show")
 
 c5, c6, c7, c8 = st.columns(4)
-c5.metric(
-    "Cancelados",
-    canceladas,
-)
-c6.metric(
-    "Execuções extras",
-    executadas_extra,
-)
-c7.metric(
-    "Índice de execução",
-    f"{indice_execucao:.1f}%",
-)
-c8.metric(
-    "Índice de perda",
-    f"{indice_perda:.1f}%",
-)
+
+exibir_card_portal(c5, "Cancelados", canceladas, "Cancelados")
+exibir_card_portal(c6, "Execuções extras", executadas_extra, "Execuções extras")
+exibir_card_portal(c7, "Índice de execução", f"{indice_execucao:.1f}%")
+exibir_card_portal(c8, "Índice de perda", f"{indice_perda:.1f}%")
 
 st.caption(
     "Índice de execução = executados do planejamento ÷ "
@@ -2977,6 +3065,9 @@ st.caption(
     "Índice de perda = improdutivas agendadas + No-show ÷ "
     "(planejados − cancelados)."
 )
+
+
+exibir_detalhe_portal(dados)
 
 # Planejamento futuro de todos os tipos de atividade.
 planejamento_futuro = (
