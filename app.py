@@ -2327,10 +2327,50 @@ def exibir_follow_portal() -> None:
                 ]
 
                 if os_lista:
-                    st.caption(
-                        "OS previstas: "
-                        + ", ".join(os_lista[:20])
-                    )
+                    st.markdown("**OS previstas para confirmação**")
+
+                    # Busca detalhes do planejamento futuro para exibir
+                    # cada OS separadamente, preservando o Follow diário.
+                    detalhes_os = carregar_planejamento_futuro_portal()
+
+                    if not detalhes_os.empty:
+                        detalhes_os = detalhes_os[
+                            detalhes_os["OS"]
+                            .astype(str)
+                            .isin(os_lista)
+                        ].copy()
+
+                    if not detalhes_os.empty:
+                        colunas_follow = [
+                            "OS",
+                            "Cliente",
+                            "Local",
+                            "Tipo de Serviço",
+                            "Status",
+                        ]
+                        colunas_follow = [
+                            c
+                            for c in colunas_follow
+                            if c in detalhes_os.columns
+                        ]
+
+                        st.dataframe(
+                            detalhes_os[colunas_follow]
+                            .drop_duplicates(
+                                subset=["OS"]
+                            )
+                            .sort_values("OS"),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.dataframe(
+                            pd.DataFrame(
+                                {"OS": os_lista}
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
                 respondido_em = follow.get("respondido_em")
                 ja_respondido = (
@@ -2692,6 +2732,30 @@ def carregar_planejamento_futuro_portal() -> pd.DataFrame:
             or {}
         )
 
+        cliente_nome = (
+            texto_limpo(
+                registro.get("cliente", "")
+            )
+            or texto_limpo(
+                dados_json.get("Cliente", "")
+            )
+        )
+
+        local_servico = (
+            texto_limpo(
+                registro.get("cidade", "")
+            )
+            or texto_limpo(
+                dados_json.get("Cidade", "")
+            )
+            or texto_limpo(
+                dados_json.get("Local", "")
+            )
+            or texto_limpo(
+                dados_json.get("Localidade", "")
+            )
+        )
+
         linha = {
             "Data": str(
                 registro.get(
@@ -2705,6 +2769,8 @@ def carregar_planejamento_futuro_portal() -> pd.DataFrame:
             or texto_limpo(
                 dados_json.get("OS", "")
             ),
+            "Cliente": cliente_nome,
+            "Local": local_servico,
             "Oficina": texto_limpo(
                 registro.get("oficina", "")
             )
@@ -2968,7 +3034,7 @@ with st.sidebar:
     st.caption("Oficina vinculada")
     st.success(OFICINA_PORTAL)
     st.divider()
-    st.caption("Portal da Oficina • MVP 1.3.1")
+    st.caption("Portal da Oficina • MVP 1.3.2")
 
 if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
     inicio, fim = periodo
@@ -3092,45 +3158,38 @@ if not planejamento_futuro.empty:
             "O objetivo é converter o máximo possível desse planejamento."
         )
 
-        resumo_futuro = (
-            proximos_7
-            .groupby(
-                "Tipo de Serviço",
-                dropna=False,
-            )
-            .size()
-            .reset_index(
-                name="Quantidade"
-            )
-            .sort_values(
-                "Quantidade",
-                ascending=False,
-            )
-        )
-
         with st.expander(
             "Ver planejamento dos próximos 7 dias"
         ):
-            st.dataframe(
-                resumo_futuro,
-                use_container_width=True,
-                hide_index=True,
+            st.caption(
+                "Cada OS aparece separadamente para facilitar "
+                "a análise de cada atendimento."
             )
+
+            colunas_planejamento = [
+                "Data",
+                "OS",
+                "Cliente",
+                "Local",
+                "Tipo de Serviço",
+                "Status",
+            ]
+
+            colunas_planejamento = [
+                coluna
+                for coluna in colunas_planejamento
+                if coluna in proximos_7.columns
+            ]
 
             st.dataframe(
                 proximos_7[
-                    [
-                        "Data",
-                        "OS",
-                        "Tipo de Serviço",
-                        "Status",
-                    ]
+                    colunas_planejamento
                 ].sort_values(
-                    ["Data", "Tipo de Serviço"]
+                    ["Data", "OS"]
                 ),
                 use_container_width=True,
                 hide_index=True,
-                height=360,
+                height=420,
             )
 
 st.divider()
