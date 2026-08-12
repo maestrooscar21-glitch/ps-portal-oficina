@@ -1161,155 +1161,228 @@ def enviar_resposta_follow_portal(
 
 def gerar_follows_automaticos_portal() -> dict:
     """
-    Cria/atualiza automaticamente os Follows da oficina a partir das
-    manutenções planejadas vigentes no Supabase.
+    Gera o Follow diretamente da tabela atividades_planejadas.
 
-    Não depende de acionamento manual da gestão:
-    Planejamento importado -> Portal identifica as OS -> Follow pendente.
-
-    Respostas já registradas nunca são apagadas.
+    Esta versão não depende de bases_importadas para descobrir as datas.
+    Ela lê o planejamento vigente salvo no Supabase, filtra:
+    - somente manutenções;
+    - somente a oficina do portal;
+    - somente registros ativos;
+    - exclui canceladas;
+    - somente hoje e datas futuras.
     """
-    bases = listar_bases()
-
-    if bases is None or bases.empty:
-        return {"criados": 0, "atualizados": 0, "pendentes": 0}
-
     hoje = date.today()
 
-    datas_planejadas = sorted(
-        {
-            str(v)
-            for v in bases.loc[
-                bases["tipo"] == "planejado",
-                "data_operacional",
-            ].astype(str)
-            if pd.notna(v)
-        }
+    registros = buscar_todos(
+        "atividades_planejadas",
+        ordem="data_operacional",
+        desc=False,
     )
 
-    datas_futuras = [
-        d
-        for d in datas_planejadas
-        if pd.to_datetime(
-            d,
-            errors="coerce",
-        ).date() >= hoje
-    ]
+    if not registros:
+        return {
+            "criados": 0,
+            "atualizados": 0,
+            "pendentes": 0,
+            "datas_detectadas": [],
+            "os_detectadas": 0,
+        }
+
+    linhas = []
+
+    for registro in registros:
+        dados = dict(registro.get("dados") or {})
+
+        linha = {
+            "data_operacional": str(
+                registro.get("data_operacional") or ""
+            ),
+            "chave_atendimento": texto_limpo(
+                registro.get("chave_atendimento", "")
+            ),
+            "os": texto_limpo(
+                registro.get("os", "")
+            ),
+            "oficina": texto_limpo(
+                registro.get("oficina", "")
+            ),
+            "tipo_atividade": texto_limpo(
+                registro.get("tipo_atividade", "")
+            ),
+            "status_atividade": texto_limpo(
+                registro.get("status_atividade", "")
+            ),
+            "ativa_no_planejamento": bool(
+                registro.get(
+                    "ativa_no_planejamento",
+                    True,
+                )
+            ),
+        }
+
+        # Fallback para dados históricos armazenados no JSON.
+        if not linha["oficina"]:
+            linha["oficina"] = texto_limpo(
+                dados.get("Oficina", "")
+            )
+
+        if not linha["tipo_atividade"]:
+            linha["tipo_atividade"] = texto_limpo(
+                dados.get("Tipo de Atividade", "")
+            )
+
+        if not linha["status_atividade"]:
+            linha["status_atividade"] = texto_limpo(
+                dados.get("Status da Atividade", "")
+            )
+
+        if not linha["os"]:
+            linha["os"] = texto_limpo(
+                dados.get("OS", "")
+            )
+
+        linhas.append(linha)
+
+    df = pd.DataFrame(linhas)
+
+    if df.empty:
+        return {
+            "criados": 0,
+            "atualizados": 0,
+            "pendentes": 0,
+            "datas_detectadas": [],
+            "os_detectadas": 0,
+        }
+
+    df["data_dt"] = pd.to_datetime(
+        df["data_operacional"],
+        errors="coerce",
+    ).dt.date
+
+    # Somente datas atuais/futuras.
+    df = df[
+        df["data_dt"].notna()
+        & (df["data_dt"] >= hoje)
+    ].copy()
+
+    # Somente registros ainda vigentes no planejamento.
+    df = df[
+        df["ativa_no_planejamento"] == True
+    ].copy()
+
+    # Somente manutenções.
+    df = df[
+        df["tipo_atividade"].apply(
+            lambda valor: (
+                "MANUTEN" in normalizar_texto(valor)
+            )
+        )
+    ].copy()
+
+    # Exclui canceladas.
+    df = df[
+        ~df["status_atividade"].apply(
+            status_cancelado
+        )
+    ].copy()
+
+    # Somente a oficina deste portal.
+    df = df[
+        df["oficina"].apply(
+            normalizar_texto
+        ) == normalizar_texto(
+            OFICINA_PORTAL
+        )
+    ].copy()
+
+    if df.empty:
+        return {
+            "criados": 0,
+            "atualizados": 0,
+            "pendentes": 0,
+            "datas_detectadas": [],
+            "os_detectadas": 0,
+        }
+
+    # Evita duplicidade da mesma atividade.
+    df["chave_unica"] = df.apply(
+        lambda linha: (
+            texto_limpo(
+                linha["chave_atendimento"]
+            )
+            or (
+                f"{linha['data_operacional']}|"
+                f"{texto_limpo(linha['os'])}"
+            )
+        ),
+        axis=1,
+    )
+
+    df = df.drop_duplicates(
+        subset=["data_operacional", "chave_unica"],
+        keep="last",
+    )
 
     cadastro = carregar_oficinas()
+
+    consultor = "Não definido"
+    telefone = ""
+    chave_oficina = normalizar_texto(
+        OFICINA_PORTAL
+    )
+
+    if not cadastro.empty:
+        cadastro_oficina = cadastro[
+            cadastro["Oficina"].apply(
+                normalizar_texto
+            ) == normalizar_texto(
+                OFICINA_PORTAL
+            )
+        ]
+
+        if not cadastro_oficina.empty:
+            cad = cadastro_oficina.iloc[0]
+
+            consultor = (
+                texto_limpo(
+                    cad.get("Consultor", "")
+                )
+                or "Não definido"
+            )
+            telefone = texto_limpo(
+                cad.get("WhatsApp", "")
+            )
+            chave_oficina = (
+                texto_limpo(
+                    cad.get("Chave Oficina", "")
+                )
+                or chave_oficina
+            )
 
     existentes_raw = buscar_todos(
         "follow_contatos",
         ordem="data_manutencao",
         desc=False,
     )
-    existentes = pd.DataFrame(existentes_raw)
+    existentes = pd.DataFrame(
+        existentes_raw
+    )
 
     criados = 0
     atualizados = 0
 
-    for data_operacional in datas_futuras:
-        planejado = carregar_base(
-            "planejado",
-            data_operacional,
-        )
-
-        if planejado is None or planejado.empty:
-            continue
-
-        planejado = filtrar_somente_manutencoes(
-            planejado
-        )
-
-        if planejado.empty:
-            continue
-
-        if "__Ativa no Planejamento" in planejado.columns:
-            planejado = planejado[
-                planejado["__Ativa no Planejamento"] == True
-            ].copy()
-
-        if "Status da Atividade" in planejado.columns:
-            planejado = planejado[
-                ~planejado["Status da Atividade"].apply(
-                    status_cancelado
-                )
-            ].copy()
-
-        if planejado.empty:
-            continue
-
-        if not cadastro.empty:
-            planejado = enriquecer_com_cadastro(
-                planejado,
-                cadastro,
-            )
-
-        planejado = planejado[
-            planejado["Oficina"]
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            .str.upper()
-            == OFICINA_PORTAL.upper()
-        ].copy()
-
-        if planejado.empty:
-            continue
-
-        planejado = criar_chaves(
-            planejado
-        ).drop_duplicates(
-            subset=["Chave Atendimento"],
-            keep="last",
-        )
-
+    for data_operacional, grupo in df.groupby(
+        "data_operacional"
+    ):
         os_lista = sorted(
             {
                 texto_limpo(v)
-                for v in planejado.get(
-                    "OS",
-                    pd.Series(dtype=str),
-                )
+                for v in grupo["os"]
                 if texto_limpo(v)
             }
         )
 
-        quantidade = len(planejado)
-
-        chave_oficina = normalizar_texto(
-            OFICINA_PORTAL
-        )
-
-        if "Chave Oficina" in planejado.columns:
-            candidatos = [
-                texto_limpo(v)
-                for v in planejado["Chave Oficina"]
-                if texto_limpo(v)
-            ]
-            if candidatos:
-                chave_oficina = candidatos[0]
-
-        consultor = "Não definido"
-        if "Consultor" in planejado.columns:
-            candidatos = [
-                texto_limpo(v)
-                for v in planejado["Consultor"]
-                if texto_limpo(v)
-                and texto_limpo(v) != "Não definido"
-            ]
-            if candidatos:
-                consultor = candidatos[0]
-
-        telefone = ""
-        if "WhatsApp" in planejado.columns:
-            candidatos = [
-                texto_limpo(v)
-                for v in planejado["WhatsApp"]
-                if texto_limpo(v)
-            ]
-            if candidatos:
-                telefone = candidatos[0]
+        quantidade = len(grupo)
 
         existente = None
 
@@ -1325,9 +1398,12 @@ def gerar_follows_automaticos_portal() -> dict:
                     existentes["oficina"]
                     .fillna("")
                     .astype(str)
-                    .str.strip()
-                    .str.upper()
-                    .eq(OFICINA_PORTAL.upper())
+                    .apply(normalizar_texto)
+                    .eq(
+                        normalizar_texto(
+                            OFICINA_PORTAL
+                        )
+                    )
                 )
 
             encontrados = existentes[
@@ -1335,20 +1411,28 @@ def gerar_follows_automaticos_portal() -> dict:
             ]
 
             if not encontrados.empty:
-                existente = encontrados.iloc[0].to_dict()
+                existente = (
+                    encontrados
+                    .sort_values("id")
+                    .iloc[-1]
+                    .to_dict()
+                )
 
-        agora = datetime.now().astimezone().isoformat()
+        agora = (
+            datetime.now()
+            .astimezone()
+            .isoformat()
+        )
 
         mensagem = (
-            f"Olá! A {OFICINA_PORTAL} possui {quantidade} "
-            f"manutenção(ões) planejada(s) para "
+            f"Olá! A {OFICINA_PORTAL} possui "
+            f"{quantidade} manutenção(ões) "
+            f"planejada(s) para "
             f"{pd.to_datetime(data_operacional).strftime('%d/%m/%Y')}. "
             "Acesse o Portal da Oficina e confirme o Follow."
         )
 
         if existente:
-            # Atualiza somente a fotografia operacional do Follow.
-            # A resposta anterior, se houver, é preservada.
             payload = {
                 "qtd_agendadas": quantidade,
                 "os_agendadas": os_lista,
@@ -1357,7 +1441,10 @@ def gerar_follows_automaticos_portal() -> dict:
                 "ultima_atualizacao": agora,
             }
 
-            if not existente.get("respondido_em"):
+            # Só reabre como pendente se ainda não houve resposta.
+            if not existente.get(
+                "respondido_em"
+            ):
                 payload["status"] = "Pendente"
 
             cliente.table(
@@ -1378,7 +1465,9 @@ def gerar_follows_automaticos_portal() -> dict:
                 {
                     "token": str(uuid.uuid4()),
                     "data_follow": hoje.isoformat(),
-                    "data_manutencao": data_operacional,
+                    "data_manutencao": (
+                        data_operacional
+                    ),
                     "chave_oficina": chave_oficina,
                     "oficina": OFICINA_PORTAL,
                     "consultor": consultor,
@@ -1397,6 +1486,7 @@ def gerar_follows_automaticos_portal() -> dict:
     follows = buscar_follow_pendentes_portal()
 
     pendentes = 0
+
     if not follows.empty:
         follows["data_dt"] = pd.to_datetime(
             follows["data_manutencao"],
@@ -1407,7 +1497,7 @@ def gerar_follows_automaticos_portal() -> dict:
             (
                 follows["data_dt"].notna()
                 & (follows["data_dt"] >= hoje)
-                & follows["respondido_em"].isna()
+                & (follows["respondido_em"].isna() | follows["respondido_em"].astype(str).str.strip().str.lower().isin(["", "nan", "none", "nat"]))
             ).sum()
         )
 
@@ -1415,6 +1505,13 @@ def gerar_follows_automaticos_portal() -> dict:
         "criados": criados,
         "atualizados": atualizados,
         "pendentes": pendentes,
+        "datas_detectadas": sorted(
+            df["data_operacional"]
+            .astype(str)
+            .unique()
+            .tolist()
+        ),
+        "os_detectadas": len(df),
     }
 
 
@@ -1439,7 +1536,7 @@ def resumo_alerta_follow_portal() -> tuple[int, int]:
     pendentes = follows[
         follows["data_dt"].notna()
         & (follows["data_dt"] >= hoje)
-        & follows["respondido_em"].isna()
+        & (follows["respondido_em"].isna() | follows["respondido_em"].astype(str).str.strip().str.lower().isin(["", "nan", "none", "nat"]))
     ].copy()
 
     if pendentes.empty:
@@ -1503,12 +1600,18 @@ def exibir_follow_portal() -> None:
                     "Status",
                     str(follow.get("status") or "Preparado"),
                 )
+                status_resposta_valor = follow.get("status_resposta")
+                status_resposta_txt = (
+                    str(status_resposta_valor).strip()
+                    if pd.notna(status_resposta_valor)
+                    and str(status_resposta_valor).strip().lower()
+                    not in ("", "nan", "none", "nat")
+                    else "Pendente"
+                )
+
                 c3.metric(
                     "Resposta",
-                    str(
-                        follow.get("status_resposta")
-                        or "Pendente"
-                    ),
+                    status_resposta_txt,
                 )
 
                 os_lista = [
@@ -1523,12 +1626,25 @@ def exibir_follow_portal() -> None:
                         + ", ".join(os_lista[:20])
                     )
 
-                if bool(follow.get("respondido_em")):
+                respondido_em = follow.get("respondido_em")
+                ja_respondido = (
+                    pd.notna(respondido_em)
+                    and str(respondido_em).strip().lower()
+                    not in ("", "nan", "none", "nat")
+                )
+
+                if ja_respondido:
                     resposta = carregar_resposta_follow_portal(
                         int(follow["id"])
                     )
 
-                    if bool(follow.get("tem_impedimento")):
+                    tem_impedimento_valor = follow.get("tem_impedimento")
+                    tem_impedimento_registrado = (
+                        pd.notna(tem_impedimento_valor)
+                        and bool(tem_impedimento_valor)
+                    )
+
+                    if tem_impedimento_registrado:
                         st.warning(
                             "⚠️ Follow respondido com impedimento."
                         )
@@ -1677,6 +1793,9 @@ def exibir_follow_portal() -> None:
 
     historico = follows[
         follows["respondido_em"].notna()
+        & ~follows["respondido_em"].astype(str).str.strip().str.lower().isin(
+            ["", "nan", "none", "nat"]
+        )
     ].copy()
 
     if historico.empty:
@@ -1728,8 +1847,18 @@ if bases is None or bases.empty:
 
 # Gera/atualiza automaticamente as pendências de Follow a partir
 # das manutenções planejadas da própria oficina.
+resultado_follow_automatico = {
+    "criados": 0,
+    "atualizados": 0,
+    "pendentes": 0,
+    "datas_detectadas": [],
+    "os_detectadas": 0,
+}
+
 try:
-    gerar_follows_automaticos_portal()
+    resultado_follow_automatico = (
+        gerar_follows_automaticos_portal()
+    )
 except Exception as erro_follow:
     st.warning(
         "Os indicadores estão disponíveis, mas não foi possível "
@@ -1766,7 +1895,7 @@ with st.sidebar:
     st.caption("Oficina vinculada")
     st.success(OFICINA_PORTAL)
     st.divider()
-    st.caption("Portal da Oficina • MVP 1.2.0")
+    st.caption("Portal da Oficina • MVP 1.2.2")
 
 if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
     inicio, fim = periodo
@@ -1874,6 +2003,26 @@ if qtd_follows_pendentes:
         f"⚠️ Você possui {qtd_os_follow_pendentes} manutenção(ões) "
         f"em {qtd_follows_pendentes} data(s) aguardando confirmação "
         "de Follow. Acesse a aba Follow e responda."
+    )
+
+datas_planejamento_detectadas = (
+    resultado_follow_automatico.get(
+        "datas_detectadas",
+        [],
+    )
+)
+
+if datas_planejamento_detectadas:
+    datas_formatadas = ", ".join(
+        pd.to_datetime(data).strftime("%d/%m/%Y")
+        for data in datas_planejamento_detectadas
+    )
+
+    st.caption(
+        "Planejamento futuro detectado para a oficina: "
+        f"**{datas_formatadas}** · "
+        f"{resultado_follow_automatico.get('os_detectadas', 0)} "
+        "manutenção(ões) vigente(s)."
     )
 
 with aba_resumo:
