@@ -223,6 +223,54 @@ def carregar_consolidado(datas: list[str]) -> pd.DataFrame:
         sort=False,
     )
 
+
+def carregar_consolidado_portal_todos_servicos(
+    datas: list[str],
+) -> pd.DataFrame:
+    """Concilia todas as atividades da oficina, não apenas manutenções."""
+    partes = []
+
+    for data_operacional in datas:
+        planejado = carregar_base(
+            "planejado",
+            data_operacional,
+        )
+        resultado = carregar_base(
+            "resultado",
+            data_operacional,
+        )
+
+        if planejado.empty and resultado.empty:
+            continue
+
+        conciliacao_data = (
+            conciliar_bases_portal_todos_servicos(
+                planejado,
+                resultado,
+            )
+        )
+
+        conciliacao_data.insert(
+            0,
+            "Data Operacional",
+            data_operacional,
+        )
+
+        partes.append(
+            conciliacao_data
+        )
+
+    if not partes:
+        return pd.DataFrame()
+
+    return pd.concat(
+        partes,
+        ignore_index=True,
+        sort=False,
+    )
+
+
+
 def carregar_oficinas() -> pd.DataFrame:
     registros = buscar_todos(
         "oficinas",
@@ -898,6 +946,664 @@ def texto_limpo(valor) -> str:
         return ""
 
     return texto
+
+
+def conciliar_bases_portal_todos_servicos(
+    planejado: pd.DataFrame,
+    resultado: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Regra híbrida:
+    - datas anteriores a DATA_CORTE_NOVA_REGRA usam a lógica histórica;
+    - a partir da data de corte, usa primeira aparição da OS para
+      classificar Agendada x Extra/Encaixe.
+    """
+    planejado = criar_chaves(planejado)
+    resultado = criar_chaves(resultado)
+
+    if "Status da Atividade" not in resultado.columns:
+        resultado["Status da Atividade"] = ""
+
+    if "Status da Atividade" not in planejado.columns:
+        planejado["Status da Atividade"] = ""
+
+    # Compatibilidade com todo o histórico já salvo:
+    # se uma importação antiga não tiver estes campos, o painel continua
+    # funcionando e exibe o detalhe como vazio, sem alterar os indicadores.
+    if "Razão da Improdutiva" not in resultado.columns:
+        resultado["Razão da Improdutiva"] = ""
+
+    if "Observação do Técnico (Improdutiva)" not in resultado.columns:
+        resultado["Observação do Técnico (Improdutiva)"] = ""
+
+    if "__Ativa no Planejamento" not in planejado.columns:
+        planejado["__Ativa no Planejamento"] = True
+
+    if "__Primeira Aparição Data" not in planejado.columns:
+        planejado["__Primeira Aparição Data"] = ""
+
+    if "__Data Operacional" not in planejado.columns:
+        planejado["__Data Operacional"] = ""
+
+    resumo_resultado = (
+        resultado
+        .groupby("Chave Atendimento", dropna=False)
+        .agg(
+            Ticket_resultado=("Ticket Jira", "first"),
+            Placa_resultado=("Placa", "first"),
+            OS_resultado=("OS", juntar_unicos),
+            Oficina_resultado=("Oficina", "first"),
+            Tipo_resultado=("Tipo de Atividade", "first"),
+            Status_resultado=("Status da Atividade", juntar_unicos),
+            Razao_improdutiva=(
+                "Razão da Improdutiva",
+                juntar_unicos,
+            ),
+            Observacao_tecnico_improdutiva=(
+                "Observação do Técnico (Improdutiva)",
+                juntar_unicos,
+            ),
+            Qtd_resultado=("Chave Atendimento", "size"),
+        )
+        .reset_index()
+    )
+
+    resumo_planejado = (
+        planejado
+        .groupby("Chave Atendimento", dropna=False)
+        .agg(
+            Ticket_planejado=("Ticket Jira", "first"),
+            Placa_planejada=("Placa", "first"),
+            OS_planejada=("OS", juntar_unicos),
+            Oficina_planejada=("Oficina", "first"),
+            Tipo_planejado=("Tipo de Atividade", "first"),
+            Status_planejado=("Status da Atividade", juntar_unicos),
+            Primeira_aparicao_data=(
+                "__Primeira Aparição Data",
+                "first",
+            ),
+            Data_operacional_planejada=(
+                "__Data Operacional",
+                "first",
+            ),
+            Ativa_planejamento=(
+                "__Ativa no Planejamento",
+                "max",
+            ),
+            Qtd_planejada=("Chave Atendimento", "size"),
+        )
+        .reset_index()
+    )
+
+    conciliacao = resumo_planejado.merge(
+        resumo_resultado,
+        on="Chave Atendimento",
+        how="outer",
+        indicator=True,
+    )
+
+    # Auditoria de substituição de OS:
+    # se a OS planejada não aparece pelo mesmo atendimento, procuramos
+    # outra OS no resultado com o MESMO Ticket Jira + MESMA placa.
+    # Nessa situação, não declaramos no-show automaticamente.
+    def chave_ticket_placa(ticket, placa) -> str:
+        ticket_norm = normalizar_texto(ticket)
+        placa_norm = normalizar_texto(placa)
+
+        if not ticket_norm or not placa_norm:
+            return ""
+
+        return f"{ticket_norm}||{placa_norm}"
+
+    chaves_resultado_ticket_placa = set()
+
+    for _, item in resumo_resultado.iterrows():
+        chave = chave_ticket_placa(
+            item.get("Ticket_resultado", ""),
+            item.get("Placa_resultado", ""),
+        )
+        if chave:
+            chaves_resultado_ticket_placa.add(chave)
+
+    def encontrou_substituicao_ticket_placa(linha) -> bool:
+        if linha.get("_merge") != "left_only":
+            return False
+
+        chave = chave_ticket_placa(
+            linha.get("Ticket_planejado", ""),
+            linha.get("Placa_planejada", ""),
+        )
+
+        return bool(
+            chave
+            and chave in chaves_resultado_ticket_placa
+        )
+
+    conciliacao["Possível substituição de OS"] = conciliacao.apply(
+        encontrou_substituicao_ticket_placa,
+        axis=1,
+    )
+
+    def data_referencia_linha(linha) -> str | None:
+        data_operacional = converter_data_operacional(
+            linha.get("Data_operacional_planejada", "")
+        )
+        return data_operacional
+
+    def usar_regra_nova(linha) -> bool:
+        data_operacional = data_referencia_linha(linha)
+
+        if not data_operacional:
+            return False
+
+        return data_operacional >= DATA_CORTE_NOVA_REGRA
+
+    def eh_agendada_nova(linha) -> bool:
+        if linha.get("_merge") == "right_only":
+            return False
+
+        if not bool(linha.get("Ativa_planejamento", False)):
+            return False
+
+        primeira = converter_data_operacional(
+            linha.get("Primeira_aparicao_data", "")
+        )
+        data_operacional = data_referencia_linha(linha)
+
+        if not primeira or not data_operacional:
+            return False
+
+        return primeira < data_operacional
+
+    def eh_agendada_historica(linha) -> bool:
+        # Na regra antiga, toda manutenção válida presente no planejado
+        # era considerada agendada, independentemente de primeira aparição.
+        if linha.get("_merge") == "right_only":
+            return False
+
+        status_planejado = linha.get("Status_planejado", "")
+
+        if status_cancelado(status_planejado):
+            return False
+
+        return True
+
+    def eh_agendada(linha) -> bool:
+        if usar_regra_nova(linha):
+            return eh_agendada_nova(linha)
+
+        return eh_agendada_historica(linha)
+
+    conciliacao["Origem Agendamento"] = conciliacao.apply(
+        lambda linha: (
+            "Agendada"
+            if eh_agendada(linha)
+            else "Extra / encaixe"
+        ),
+        axis=1,
+    )
+
+    def classificar(linha) -> str:
+        origem_merge = linha["_merge"]
+        status_resultado = linha.get("Status_resultado", "")
+        status_planejado = linha.get("Status_planejado", "")
+        agendada = linha["Origem Agendamento"] == "Agendada"
+        ativa = bool(linha.get("Ativa_planejamento", False))
+        nova_regra = usar_regra_nova(linha)
+
+        # Histórico antigo preserva a lógica anterior.
+        if not nova_regra:
+            if origem_merge == "left_only":
+                if status_cancelado(status_planejado):
+                    return "Cancelada no agendamento"
+                if bool(
+                    linha.get(
+                        "Possível substituição de OS",
+                        False,
+                    )
+                ):
+                    return "Possível substituição de OS"
+                return "No-show"
+
+            if origem_merge == "right_only":
+                if status_improdutivo(status_resultado):
+                    return "Improdutiva extra"
+                if status_cancelado(status_resultado):
+                    return "Cancelada extra"
+                if status_executado(status_resultado):
+                    return "Executada extra"
+                return "Evento extra"
+
+            if status_cancelado(status_planejado):
+                return "Cancelada no agendamento"
+
+            if status_improdutivo(status_resultado):
+                return "Improdutiva agendada"
+
+            if status_cancelado(status_resultado):
+                return "Cancelada"
+
+            if status_executado(status_resultado):
+                return "Executada agendada"
+
+            return "Status intermediário agendado"
+
+        # Nova regra, a partir da data de corte.
+        if origem_merge == "left_only" and not ativa:
+            return "Retirada do agendamento"
+
+        if (
+            origem_merge in {"left_only", "both"}
+            and ativa
+            and status_cancelado(status_planejado)
+        ):
+            return "Cancelada no agendamento"
+
+        if origem_merge == "left_only":
+            if agendada:
+                if bool(
+                    linha.get(
+                        "Possível substituição de OS",
+                        False,
+                    )
+                ):
+                    return "Possível substituição de OS"
+                return "No-show"
+            return "Encaixe não realizado"
+
+        if origem_merge == "right_only":
+            if status_improdutivo(status_resultado):
+                return "Improdutiva extra"
+            if status_cancelado(status_resultado):
+                return "Cancelada extra"
+            if status_executado(status_resultado):
+                return "Executada extra"
+            return "Evento extra"
+
+        if status_improdutivo(status_resultado):
+            return (
+                "Improdutiva agendada"
+                if agendada
+                else "Improdutiva extra"
+            )
+
+        if status_cancelado(status_resultado):
+            return (
+                "Cancelada"
+                if agendada
+                else "Cancelada extra"
+            )
+
+        if status_executado(status_resultado):
+            return (
+                "Executada agendada"
+                if agendada
+                else "Executada extra"
+            )
+
+        return (
+            "Status intermediário agendado"
+            if agendada
+            else "Status intermediário extra"
+        )
+
+    conciliacao["Classificação"] = conciliacao.apply(
+        classificar,
+        axis=1,
+    )
+
+    def explicar_classificacao(linha) -> str:
+        classificacao = linha.get("Classificação", "")
+        status_planejado = texto_limpo(
+            linha.get("Status_planejado", "")
+        )
+        status_resultado = texto_limpo(
+            linha.get("Status_resultado", "")
+        )
+        primeira = texto_limpo(
+            linha.get("Primeira_aparicao_data", "")
+        )
+        data_operacional = texto_limpo(
+            linha.get("Data_operacional_planejada", "")
+        )
+        nova_regra = usar_regra_nova(linha)
+
+        if not nova_regra:
+            return (
+                "Histórico anterior à data de corte: classificação "
+                "preservada pela lógica antiga do painel."
+            )
+
+        if classificacao == "Executada agendada":
+            return (
+                f"Manutenção já estava agendada antes de {data_operacional} "
+                f"(primeira aparição: {primeira}) e foi executada."
+            )
+        if classificacao == "Executada extra":
+            return (
+                "Manutenção não tinha prova de agendamento para essa data "
+                "antes do início do dia e foi executada como extra/encaixe."
+            )
+        if classificacao == "Improdutiva agendada":
+            return (
+                "Manutenção já estava agendada antes do dia e terminou "
+                f"improdutiva/não concluída: {status_resultado}"
+            )
+        if classificacao == "Improdutiva extra":
+            return (
+                "Manutenção extra/encaixe terminou improdutiva/não concluída: "
+                f"{status_resultado}"
+            )
+        if classificacao == "Cancelada":
+            return (
+                "Manutenção estava agendada válida e apareceu cancelada "
+                f"posteriormente no resultado: {status_resultado}"
+            )
+        if classificacao == "Cancelada extra":
+            return (
+                "Cancelamento de manutenção sem prova de agendamento "
+                "anterior para essa mesma data."
+            )
+        if classificacao == "Cancelada no agendamento":
+            return (
+                "A manutenção já estava cancelada na fotografia vigente "
+                f"do agendamento: {status_planejado}"
+            )
+        if classificacao == "Possível substituição de OS":
+            return (
+                "A OS agendada não apareceu pelo mesmo atendimento, mas "
+                "foi localizada outra OS no resultado com o mesmo Ticket "
+                "Jira + mesma placa. O caso foi retirado do no-show para "
+                "auditoria de possível troca/substituição de OS."
+            )
+        if classificacao == "No-show":
+            return (
+                "Manutenção estava agendada antes do dia, a própria OS não "
+                "apareceu no resultado e nenhuma outra OS com o mesmo Ticket "
+                "Jira + mesma placa foi localizada. Classificada como "
+                "no-show provável."
+            )
+        if classificacao == "Encaixe não realizado":
+            return (
+                "A manutenção surgiu no próprio dia como extra/encaixe "
+                "e não apareceu no resultado; não conta como no-show."
+            )
+        if classificacao == "Retirada do agendamento":
+            return (
+                "A OS apareceu em fotografia anterior, mas não está mais "
+                "no agendamento vigente dessa data."
+            )
+
+        return (
+            "Status não reconhecido pelas regras principais. "
+            f"Planejado: {status_planejado}; resultado: {status_resultado}."
+        )
+
+    conciliacao["Motivo da Classificação"] = conciliacao.apply(
+        explicar_classificacao,
+        axis=1,
+    )
+
+    conciliacao["Regra Aplicada"] = conciliacao.apply(
+        lambda linha: (
+            "Nova regra"
+            if usar_regra_nova(linha)
+            else "Regra histórica"
+        ),
+        axis=1,
+    )
+
+    conciliacao["Troca de OS"] = conciliacao.apply(
+        lambda linha: (
+            "Sim"
+            if (
+                linha["_merge"] == "both"
+                and texto_limpo(
+                    linha.get("OS_planejada", "")
+                )
+                != texto_limpo(
+                    linha.get("OS_resultado", "")
+                )
+            )
+            else "Não"
+        ),
+        axis=1,
+    )
+
+    conciliacao["Oficina"] = conciliacao[
+        "Oficina_planejada"
+    ].fillna(conciliacao["Oficina_resultado"])
+
+    conciliacao["Ticket"] = conciliacao[
+        "Ticket_planejado"
+    ].fillna(conciliacao["Ticket_resultado"])
+
+    conciliacao["Placa"] = conciliacao[
+        "Placa_planejada"
+    ].fillna(conciliacao["Placa_resultado"])
+
+    conciliacao["Tipo de Serviço"] = conciliacao[
+        "Tipo_planejado"
+    ].fillna(conciliacao["Tipo_resultado"])
+
+    return conciliacao
+
+def converter_data_operacional(valor) -> str | None:
+    texto = texto_limpo(valor)
+
+    if not texto:
+        return None
+
+    for dayfirst in (True, False):
+        try:
+            data_convertida = pd.to_datetime(
+                texto,
+                dayfirst=dayfirst,
+                errors="raise",
+            )
+            return data_convertida.date().isoformat()
+        except Exception:
+            pass
+
+    return None
+
+def criar_chaves(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    for coluna in ["Ticket Jira", "Placa", "OS"]:
+        if coluna not in df.columns:
+            df[coluna] = ""
+
+        df[coluna] = df[coluna].apply(texto_limpo)
+
+    df["Chave Ticket"] = df["Ticket Jira"].apply(normalizar_texto)
+    df["Chave Placa"] = df["Placa"].apply(normalizar_texto)
+    df["Chave OS"] = df["OS"].apply(normalizar_texto)
+
+    # Os indicadores do painel são baseados em OS.
+    # Quando houver OS, ela será a chave principal. A regra anterior
+    # usava Ticket + Placa e podia agrupar OS diferentes.
+    possui_os = df["Chave OS"] != ""
+
+    df["Chave Atendimento"] = ""
+
+    df.loc[possui_os, "Chave Atendimento"] = (
+        "OS|"
+        + df.loc[possui_os, "Chave OS"]
+        + "|"
+        + df.loc[possui_os, "Chave Placa"]
+    )
+
+    sem_os = ~possui_os
+
+    df.loc[sem_os, "Chave Atendimento"] = (
+        "TICKET|"
+        + df.loc[sem_os, "Chave Ticket"]
+        + "|"
+        + df.loc[sem_os, "Chave Placa"]
+    )
+
+    sem_identificador = (
+        (df["Chave Ticket"] == "")
+        & (df["Chave OS"] == "")
+        & (df["Chave Placa"] == "")
+    )
+
+    df.loc[sem_identificador, "Chave Atendimento"] = (
+        "LINHA|" + df.index[sem_identificador].astype(str)
+    )
+
+    return df
+
+def enriquecer_com_cadastro(
+    base: pd.DataFrame,
+    cadastro: pd.DataFrame,
+) -> pd.DataFrame:
+    resultado = base.copy()
+
+    if "Oficina" not in resultado.columns:
+        resultado["Oficina"] = ""
+
+    resultado["Chave Oficina"] = resultado["Oficina"].apply(
+        normalizar_texto
+    )
+
+    colunas = [
+        "Chave Oficina",
+        "Cidade-base",
+        "UF-base",
+        "Consultor",
+        "WhatsApp",
+        "Prioridade",
+    ]
+
+    resultado = resultado.merge(
+        cadastro[colunas].drop_duplicates(
+            subset=["Chave Oficina"]
+        ),
+        on="Chave Oficina",
+        how="left",
+    )
+
+    resultado["Consultor"] = resultado["Consultor"].fillna(
+        "Não definido"
+    )
+    resultado["Cidade-base"] = resultado["Cidade-base"].fillna("")
+    resultado["UF-base"] = resultado["UF-base"].fillna("")
+    resultado["WhatsApp"] = resultado["WhatsApp"].fillna("")
+    resultado["Prioridade"] = resultado["Prioridade"].fillna("Normal")
+
+    return resultado
+
+def exigir_supabase() -> Client:
+    if SUPABASE is None:
+        st.error(ERRO_SUPABASE or "Supabase não conectado.")
+        st.stop()
+
+    return SUPABASE
+
+def filtrar_somente_manutencoes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mantém somente atividades cujo Tipo de Atividade contenha
+    a palavra MANUTEN, cobrindo manutenção, manutenções,
+    manutenção corretiva, preventiva e demais variações.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=df.columns if df is not None else [])
+
+    if "Tipo de Atividade" not in df.columns:
+        raise ValueError(
+            "A base não possui a coluna 'Tipo de Atividade'. "
+            "Não foi possível filtrar somente manutenções."
+        )
+
+    base = df.copy()
+
+    mascara = base["Tipo de Atividade"].apply(
+        lambda valor: "MANUTEN" in normalizar_texto(valor)
+    )
+
+    return base[mascara].copy().reset_index(drop=True)
+
+def juntar_unicos(valores) -> str:
+    itens = sorted(
+        {
+            texto_limpo(valor)
+            for valor in valores
+            if texto_limpo(valor)
+        }
+    )
+    return " | ".join(itens)
+
+def listar_bases() -> pd.DataFrame:
+    registros = buscar_todos(
+        "bases_importadas",
+        ordem="data_operacional",
+        desc=True,
+    )
+    return pd.DataFrame(registros)
+
+def normalizar_texto(valor) -> str:
+    texto = texto_limpo(valor).upper()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(
+        caractere
+        for caractere in texto
+        if not unicodedata.combining(caractere)
+    )
+    texto = re.sub(r"\s+", " ", texto)
+    return texto.strip()
+
+def status_cancelado(valor) -> bool:
+    return "CANCEL" in status_normalizado(valor)
+
+def status_executado(valor) -> bool:
+    status = status_normalizado(valor)
+    return any(
+        termo in status
+        for termo in [
+            "CONCLUID",
+            "EXECUTAD",
+            "FINALIZAD",
+            "COMPLET",
+            "REALIZAD",
+        ]
+    )
+
+def status_improdutivo(valor) -> bool:
+    status = status_normalizado(valor)
+    return any(
+        termo in status
+        for termo in [
+            "NAO CONCLUIDO",
+            "NAO CONCLUIDA",
+            "IMPRODUTIVO",
+            "IMPRODUTIVA",
+            "SEM SUCESSO",
+        ]
+    )
+
+def status_normalizado(valor) -> str:
+    return normalizar_texto(valor)
+
+def texto_limpo(valor) -> str:
+    if valor is None:
+        return ""
+
+    try:
+        if pd.isna(valor):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    texto = str(valor).strip()
+
+    if texto.lower() in {"nan", "none", "null", "nat"}:
+        return ""
+
+    return texto
+
+
 
 
 def calcular_indicadores(conciliacao: pd.DataFrame) -> dict:
@@ -1822,12 +2528,269 @@ def exibir_follow_portal() -> None:
         )
 
 
+
+def calcular_indicadores_portal_todos_servicos(
+    conciliacao: pd.DataFrame,
+) -> dict:
+    classes = conciliacao[
+        "Classificação"
+    ].fillna("").astype(str)
+
+    planejadas_validas = {
+        "Executada agendada",
+        "Improdutiva agendada",
+        "Cancelada",
+        "No-show",
+        "Status intermediário agendado",
+    }
+
+    planejadas = int(
+        classes.isin(
+            planejadas_validas
+        ).sum()
+    )
+
+    executadas_agendadas = int(
+        (
+            classes
+            == "Executada agendada"
+        ).sum()
+    )
+
+    executadas_extras = int(
+        (
+            classes
+            == "Executada extra"
+        ).sum()
+    )
+
+    improdutivas_agendadas = int(
+        (
+            classes
+            == "Improdutiva agendada"
+        ).sum()
+    )
+
+    improdutivas_extras = int(
+        (
+            classes
+            == "Improdutiva extra"
+        ).sum()
+    )
+
+    no_show = int(
+        (
+            classes
+            == "No-show"
+        ).sum()
+    )
+
+    canceladas = int(
+        (
+            classes
+            == "Cancelada"
+        ).sum()
+    )
+
+    base_executavel = max(
+        planejadas - canceladas,
+        0,
+    )
+
+    indice_execucao = (
+        executadas_agendadas
+        / base_executavel
+        * 100
+        if base_executavel
+        else 0.0
+    )
+
+    perdas_agendadas = (
+        improdutivas_agendadas
+        + no_show
+    )
+
+    indice_perda = (
+        perdas_agendadas
+        / base_executavel
+        * 100
+        if base_executavel
+        else 0.0
+    )
+
+    if (
+        indice_execucao >= 90
+        and indice_perda <= 10
+    ):
+        nivel = "Excelente"
+        simbolo = "🟢"
+        mensagem = (
+            "Ótimo aproveitamento do planejamento. "
+            "Mantenha o ritmo e continue prevenindo perdas."
+        )
+    elif (
+        indice_execucao >= 75
+        and indice_perda <= 20
+    ):
+        nivel = "Atenção"
+        simbolo = "🟡"
+        mensagem = (
+            "O desempenho está razoável, mas existem perdas "
+            "que podem ser reduzidas."
+        )
+    else:
+        nivel = "Crítico"
+        simbolo = "🔴"
+        mensagem = (
+            "Há perda relevante do planejamento. "
+            "Priorize No-show, improdutivas e pendências futuras."
+        )
+
+    return {
+        "Planejadas": planejadas,
+        "Executadas agendadas": executadas_agendadas,
+        "Executadas extras": executadas_extras,
+        "Executadas totais": (
+            executadas_agendadas
+            + executadas_extras
+        ),
+        "Improdutivas": (
+            improdutivas_agendadas
+            + improdutivas_extras
+        ),
+        "Improdutivas agendadas": improdutivas_agendadas,
+        "Improdutivas extras": improdutivas_extras,
+        "No-show": no_show,
+        "Canceladas": canceladas,
+        "Índice de execução": indice_execucao,
+        "Índice de perda": indice_perda,
+        "Nível": nivel,
+        "Símbolo": simbolo,
+        "Mensagem": mensagem,
+    }
+
+
+def carregar_planejamento_futuro_portal() -> pd.DataFrame:
+    """
+    Planejamento futuro de TODOS os tipos de serviço da oficina.
+    Follow continua sendo exclusivo para manutenções.
+    """
+    registros = buscar_todos(
+        "atividades_planejadas",
+        ordem="data_operacional",
+        desc=False,
+    )
+
+    if not registros:
+        return pd.DataFrame()
+
+    linhas = []
+
+    for registro in registros:
+        dados_json = dict(
+            registro.get("dados")
+            or {}
+        )
+
+        linha = {
+            "Data": str(
+                registro.get(
+                    "data_operacional"
+                )
+                or ""
+            ),
+            "OS": texto_limpo(
+                registro.get("os", "")
+            )
+            or texto_limpo(
+                dados_json.get("OS", "")
+            ),
+            "Oficina": texto_limpo(
+                registro.get("oficina", "")
+            )
+            or texto_limpo(
+                dados_json.get("Oficina", "")
+            ),
+            "Tipo de Serviço": texto_limpo(
+                registro.get(
+                    "tipo_atividade",
+                    "",
+                )
+            )
+            or texto_limpo(
+                dados_json.get(
+                    "Tipo de Atividade",
+                    "",
+                )
+            ),
+            "Status": texto_limpo(
+                registro.get(
+                    "status_atividade",
+                    "",
+                )
+            )
+            or texto_limpo(
+                dados_json.get(
+                    "Status da Atividade",
+                    "",
+                )
+            ),
+            "Ativa": bool(
+                registro.get(
+                    "ativa_no_planejamento",
+                    True,
+                )
+            ),
+        }
+
+        linhas.append(linha)
+
+    df = pd.DataFrame(
+        linhas
+    )
+
+    if df.empty:
+        return df
+
+    df["Data_dt"] = pd.to_datetime(
+        df["Data"],
+        errors="coerce",
+    ).dt.date
+
+    hoje = date.today()
+
+    df = df[
+        df["Data_dt"].notna()
+        & (df["Data_dt"] >= hoje)
+        & (df["Ativa"] == True)
+    ].copy()
+
+    df = df[
+        df["Oficina"].apply(
+            normalizar_texto
+        )
+        == normalizar_texto(
+            OFICINA_PORTAL
+        )
+    ].copy()
+
+    df = df[
+        ~df["Status"].apply(
+            status_cancelado
+        )
+    ].copy()
+
+    return df
+
+
+
+
 # =========================================================
 # PORTAL YESHUA — MVP 1.0 (SOMENTE LEITURA)
 # =========================================================
 
 st.title("🏢 YESHUA RASTREAMENTO")
-st.caption("Portal de Desempenho Operacional • Oficina parceira PS")
+st.caption("Portal Operacional • Planejamento, execução e Follow")
 
 st.info(
     "Portal piloto com Follow automático. As manutenções planejadas importadas "
@@ -1895,7 +2858,7 @@ with st.sidebar:
     st.caption("Oficina vinculada")
     st.success(OFICINA_PORTAL)
     st.divider()
-    st.caption("Portal da Oficina • MVP 1.2.2")
+    st.caption("Portal da Oficina • MVP 1.3.0")
 
 if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
     inicio, fim = periodo
@@ -1912,7 +2875,7 @@ if not datas_periodo:
     st.stop()
 
 with st.spinner("Atualizando indicadores da oficina..."):
-    consolidado = carregar_consolidado(datas_periodo)
+    consolidado = carregar_consolidado_portal_todos_servicos(datas_periodo)
     cadastro = carregar_oficinas()
     if not cadastro.empty:
         consolidado = enriquecer_com_cadastro(consolidado, cadastro)
@@ -1941,41 +2904,143 @@ if dados.empty:
     )
     st.stop()
 
-# Usa exatamente o mesmo cálculo do painel interno.
-indicadores = calcular_indicadores(dados)
+# Indicadores do Portal: todos os tipos de serviço.
+indicadores = calcular_indicadores_portal_todos_servicos(
+    dados
+)
 
-agendadas = indicadores["Planejadas"]
-executadas_ag = indicadores["Executadas planejadas"]
+planejadas = indicadores["Planejadas"]
+executadas_ag = indicadores["Executadas agendadas"]
 executadas_extra = indicadores["Executadas extras"]
-executadas = executadas_ag + executadas_extra
+executadas = indicadores["Executadas totais"]
 improdutivas = indicadores["Improdutivas"]
 improd_ag = indicadores["Improdutivas agendadas"]
 improd_extra = indicadores["Improdutivas extras"]
 no_show = indicadores["No-show"]
 canceladas = indicadores["Canceladas"]
-mci = indicadores["MCI"]
-md = indicadores["MD"]
-substituicoes = indicadores["Possíveis substituições de OS"]
+indice_execucao = indicadores["Índice de execução"]
+indice_perda = indicadores["Índice de perda"]
 
-st.subheader(f"Visão do período • {inicio.strftime('%d/%m/%Y')} a {fim.strftime('%d/%m/%Y')}")
+st.subheader(
+    f"Seu desempenho • "
+    f"{inicio.strftime('%d/%m/%Y')} a "
+    f"{fim.strftime('%d/%m/%Y')}"
+)
+
+st.markdown(
+    f"### {indicadores['Símbolo']} "
+    f"Termômetro operacional: **{indicadores['Nível']}**"
+)
+st.caption(
+    indicadores["Mensagem"]
+)
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Manutenções agendadas", agendadas)
-c2.metric("Agendadas executadas", executadas_ag)
-c3.metric("Executadas extras", executadas_extra)
-c4.metric("Improdutivas", improdutivas)
+c1.metric(
+    "Serviços planejados",
+    planejadas,
+)
+c2.metric(
+    "Executados",
+    executadas,
+)
+c3.metric(
+    "Não concluídos",
+    improdutivas,
+)
+c4.metric(
+    "No-show",
+    no_show,
+)
 
 c5, c6, c7, c8 = st.columns(4)
-c5.metric("No-show", no_show)
-c6.metric("Canceladas", canceladas)
-c7.metric("MCI", f"{mci:.1f}%")
-c8.metric("MD • Improdutividade", f"{md:.1f}%")
+c5.metric(
+    "Cancelados",
+    canceladas,
+)
+c6.metric(
+    "Execuções extras",
+    executadas_extra,
+)
+c7.metric(
+    "Índice de execução",
+    f"{indice_execucao:.1f}%",
+)
+c8.metric(
+    "Índice de perda",
+    f"{indice_perda:.1f}%",
+)
 
 st.caption(
-    f"Execuções totais no período: **{executadas}** "
-    f"({executadas_ag} agendadas + {executadas_extra} extras). "
-    f"Possíveis substituições de OS: **{substituicoes}**."
+    "Índice de execução = executados do planejamento ÷ "
+    "(planejados − cancelados). "
+    "Índice de perda = improdutivas agendadas + No-show ÷ "
+    "(planejados − cancelados)."
 )
+
+# Planejamento futuro de todos os tipos de atividade.
+planejamento_futuro = (
+    carregar_planejamento_futuro_portal()
+)
+
+if not planejamento_futuro.empty:
+    hoje = date.today()
+    fim_semana = hoje + timedelta(
+        days=6
+    )
+
+    proximos_7 = planejamento_futuro[
+        planejamento_futuro["Data_dt"]
+        <= fim_semana
+    ].copy()
+
+    if not proximos_7.empty:
+        st.info(
+            f"📅 Você possui **{len(proximos_7)} serviço(s)** "
+            "planejado(s) para os próximos 7 dias. "
+            "O objetivo é converter o máximo possível desse planejamento."
+        )
+
+        resumo_futuro = (
+            proximos_7
+            .groupby(
+                "Tipo de Serviço",
+                dropna=False,
+            )
+            .size()
+            .reset_index(
+                name="Quantidade"
+            )
+            .sort_values(
+                "Quantidade",
+                ascending=False,
+            )
+        )
+
+        with st.expander(
+            "Ver planejamento dos próximos 7 dias"
+        ):
+            st.dataframe(
+                resumo_futuro,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.dataframe(
+                proximos_7[
+                    [
+                        "Data",
+                        "OS",
+                        "Tipo de Serviço",
+                        "Status",
+                    ]
+                ].sort_values(
+                    ["Data", "Tipo de Serviço"]
+                ),
+                use_container_width=True,
+                hide_index=True,
+                height=360,
+            )
 
 st.divider()
 
@@ -1990,10 +3055,10 @@ rotulo_follow = (
 )
 
 aba_resumo, aba_improd, aba_noshow, aba_os, aba_follow = st.tabs([
-    "📈 Desempenho",
-    "🔴 Improdutivas",
+    "📊 Resumo",
+    "🔴 Não concluídos",
     "🚫 No-show",
-    "🔎 Minhas OS",
+    "🔎 Serviços",
     rotulo_follow,
 ])
 
@@ -2026,6 +3091,30 @@ if datas_planejamento_detectadas:
     )
 
 with aba_resumo:
+    st.markdown("### Serviços por tipo")
+
+    if "Tipo de Serviço" in dados.columns:
+        tipos_resumo = (
+            dados[
+                "Tipo de Serviço"
+            ]
+            .fillna("Não informado")
+            .astype(str)
+            .value_counts()
+            .rename_axis(
+                "Tipo de Serviço"
+            )
+            .reset_index(
+                name="Quantidade"
+            )
+        )
+
+        st.dataframe(
+            tipos_resumo,
+            use_container_width=True,
+            hide_index=True,
+        )
+
     st.markdown("### Evolução diária")
     diario = (
         dados.groupby(["Data Operacional", "Classificação"])
@@ -2055,7 +3144,7 @@ with aba_improd:
     ].copy()
 
     st.markdown(
-        f"### {len(imp)} improdutiva(s) no período "
+        f"### {len(imp)} serviço(s) não concluído(s) no período "
         f"• {improd_ag} agendada(s) • {improd_extra} extra(s)"
     )
 
@@ -2085,8 +3174,9 @@ with aba_improd:
 
         cols = [
             c for c in [
-                "Data Operacional", "Classificação", "Ticket", "Placa",
-                "OS_planejada", "OS_resultado", motivo_col, obs_col
+                "Data Operacional", "Tipo de Serviço", "Classificação",
+                "Ticket", "Placa", "OS_planejada", "OS_resultado",
+                motivo_col, obs_col
             ] if c in imp.columns
         ]
         st.dataframe(imp[cols], use_container_width=True, hide_index=True)
@@ -2100,7 +3190,7 @@ with aba_noshow:
     else:
         cols = [
             c for c in [
-                "Data Operacional", "Ticket", "Placa",
+                "Data Operacional", "Tipo de Serviço", "Ticket", "Placa",
                 "OS_planejada", "OS_resultado", "Consultor", "UF-base"
             ] if c in ns.columns
         ]
@@ -2121,8 +3211,8 @@ with aba_os:
 
     cols = [
         c for c in [
-            "Data Operacional", "Classificação", "Ticket", "Placa",
-            "OS_planejada", "OS_resultado", "Troca de OS",
+            "Data Operacional", "Tipo de Serviço", "Classificação",
+            "Ticket", "Placa", "OS_planejada", "OS_resultado", "Troca de OS",
             "Razao_improdutiva", "Observacao_tecnico_improdutiva"
         ] if c in detalhe.columns
     ]
