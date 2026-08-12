@@ -2259,17 +2259,323 @@ def resumo_alerta_follow_portal() -> tuple[int, int]:
     )
 
 
+
+def carregar_respostas_os_follow(
+    follow_id: int,
+) -> pd.DataFrame:
+    resposta = (
+        cliente.table("follow_respostas_os")
+        .select("*")
+        .eq("follow_id", follow_id)
+        .order("os_numero")
+        .execute()
+    )
+
+    return pd.DataFrame(
+        resposta.data or []
+    )
+
+
+def salvar_resposta_os_follow(
+    follow: dict,
+    os_numero: str,
+    nome_respondente: str,
+    equipamentos: str,
+    veiculo: str,
+    capacidade: str,
+    tem_impedimento: bool,
+    motivos: list[str],
+    observacao: str,
+    previsao: str,
+) -> None:
+    agora = datetime.now().astimezone().isoformat()
+
+    payload = {
+        "follow_id": int(follow["id"]),
+        "os_numero": texto_limpo(os_numero),
+        "nome_respondente": nome_respondente,
+        "equipamentos_ok": equipamentos == "Sim",
+        "veiculo_disponivel": veiculo,
+        "capacidade_ok": capacidade == "Sim",
+        "tem_impedimento": tem_impedimento,
+        "motivos": motivos,
+        "observacao": observacao,
+        "previsao_solucao": previsao,
+        "respondido_em": agora,
+        "atualizado_em": agora,
+    }
+
+    (
+        cliente.table("follow_respostas_os")
+        .upsert(
+            payload,
+            on_conflict="follow_id,os_numero",
+        )
+        .execute()
+    )
+
+    atualizar_resumo_follow_por_os(
+        follow
+    )
+
+
+def confirmar_todas_os_ok(
+    follow: dict,
+    os_lista: list[str],
+    nome_respondente: str,
+) -> None:
+    agora = datetime.now().astimezone().isoformat()
+
+    registros = []
+
+    for os_numero in os_lista:
+        registros.append(
+            {
+                "follow_id": int(follow["id"]),
+                "os_numero": texto_limpo(os_numero),
+                "nome_respondente": nome_respondente,
+                "equipamentos_ok": True,
+                "veiculo_disponivel": "Sim",
+                "capacidade_ok": True,
+                "tem_impedimento": False,
+                "motivos": [],
+                "observacao": "",
+                "previsao_solucao": "",
+                "respondido_em": agora,
+                "atualizado_em": agora,
+            }
+        )
+
+    if registros:
+        (
+            cliente.table("follow_respostas_os")
+            .upsert(
+                registros,
+                on_conflict="follow_id,os_numero",
+            )
+            .execute()
+        )
+
+    atualizar_resumo_follow_por_os(
+        follow
+    )
+
+
+def atualizar_resumo_follow_por_os(
+    follow: dict,
+) -> None:
+    respostas = carregar_respostas_os_follow(
+        int(follow["id"])
+    )
+
+    os_lista = [
+        texto_limpo(v)
+        for v in (follow.get("os_agendadas") or [])
+        if texto_limpo(v)
+    ]
+
+    total = len(os_lista)
+
+    if respostas.empty:
+        respondidas = 0
+        com_impedimento = 0
+        sem_impedimento = 0
+    else:
+        respostas = respostas[
+            respostas["os_numero"]
+            .astype(str)
+            .isin(os_lista)
+        ].copy()
+
+        respondidas = int(
+            respostas["os_numero"]
+            .astype(str)
+            .nunique()
+        )
+
+        com_impedimento = int(
+            respostas[
+                respostas["tem_impedimento"] == True
+            ]["os_numero"]
+            .astype(str)
+            .nunique()
+        )
+
+        sem_impedimento = max(
+            respondidas - com_impedimento,
+            0,
+        )
+
+    faltantes = max(
+        total - respondidas,
+        0,
+    )
+
+    agora = datetime.now().astimezone().isoformat()
+
+    if total and faltantes == 0:
+        status = "Respondido"
+
+        if com_impedimento:
+            status_resposta = (
+                f"{com_impedimento} com impedimento · "
+                f"{sem_impedimento} sem impedimento"
+            )
+            tem_impedimento = True
+        else:
+            status_resposta = "Sem impedimento"
+            tem_impedimento = False
+
+        respondido_em = agora
+
+    elif respondidas > 0:
+        status = "Parcial"
+        status_resposta = (
+            f"{respondidas}/{total} OS respondidas"
+        )
+        tem_impedimento = (
+            com_impedimento > 0
+        )
+        respondido_em = None
+
+    else:
+        status = "Pendente"
+        status_resposta = "Pendente"
+        tem_impedimento = False
+        respondido_em = None
+
+    cliente.table("follow_contatos").update(
+        {
+            "status": status,
+            "status_resposta": status_resposta,
+            "tem_impedimento": tem_impedimento,
+            "respondido_em": respondido_em,
+            "ultima_atualizacao": agora,
+        }
+    ).eq(
+        "id",
+        int(follow["id"]),
+    ).execute()
+
+    # Compatibilidade com o painel de gestão atual:
+    # sempre que houver respostas individuais, gravamos também um resumo
+    # na tabela legada follow_respostas.
+    if respondidas > 0:
+        motivos = []
+        os_afetadas = []
+        observacoes = []
+
+        if not respostas.empty:
+            for _, item in respostas.iterrows():
+                if bool(
+                    item.get(
+                        "tem_impedimento",
+                        False,
+                    )
+                ):
+                    os_afetadas.append(
+                        texto_limpo(
+                            item.get(
+                                "os_numero",
+                                "",
+                            )
+                        )
+                    )
+
+                motivos_item = (
+                    item.get("motivos")
+                    or []
+                )
+                motivos.extend(
+                    [
+                        texto_limpo(v)
+                        for v in motivos_item
+                        if texto_limpo(v)
+                    ]
+                )
+
+                obs = texto_limpo(
+                    item.get(
+                        "observacao",
+                        "",
+                    )
+                )
+                if obs:
+                    observacoes.append(
+                        f"{texto_limpo(item.get('os_numero',''))}: {obs}"
+                    )
+
+        cliente.table(
+            "follow_respostas"
+        ).insert(
+            {
+                "follow_id": int(follow["id"]),
+                "token": str(follow["token"]),
+                "nome_respondente": "Resposta individual por OS",
+                "equipamentos_ok": bool(
+                    respostas["equipamentos_ok"]
+                    .fillna(False)
+                    .all()
+                )
+                if not respostas.empty
+                else False,
+                "veiculo_disponivel": (
+                    "Sim"
+                    if (
+                        not respostas.empty
+                        and (
+                            respostas["veiculo_disponivel"]
+                            .fillna("")
+                            == "Sim"
+                        ).all()
+                    )
+                    else "Parcial"
+                ),
+                "capacidade_ok": bool(
+                    respostas["capacidade_ok"]
+                    .fillna(False)
+                    .all()
+                )
+                if not respostas.empty
+                else False,
+                "tem_impedimento": (
+                    com_impedimento > 0
+                ),
+                "motivos": sorted(
+                    set(motivos)
+                ),
+                "os_afetadas": sorted(
+                    set(
+                        [
+                            v
+                            for v in os_afetadas
+                            if v
+                        ]
+                    )
+                ),
+                "observacao": " | ".join(
+                    observacoes
+                ),
+                "previsao_solucao": "",
+                "respondido_em": agora,
+            }
+        ).execute()
+
+
+
 def exibir_follow_portal() -> None:
     st.markdown("### 📞 Follow de Manutenções")
     st.caption(
-        "As manutenções planejadas aparecem aqui automaticamente. "
-        "A oficina deve confirmar se está tudo OK ou informar impedimentos."
+        "Cada OS deve ser confirmada individualmente. "
+        "Se todas estiverem OK, use o botão de confirmação em lote."
     )
 
     follows = buscar_follow_pendentes_portal()
 
     if follows.empty:
-        st.success("Você não possui Follow disponível no momento.")
+        st.success(
+            "Você não possui Follow disponível no momento."
+        )
         return
 
     hoje = date.today()
@@ -2285,289 +2591,589 @@ def exibir_follow_portal() -> None:
     ].copy()
 
     if pendentes.empty:
-        st.info("Não há Follow pendente para datas atuais ou futuras.")
-    else:
-        st.markdown("#### Pendências para confirmação")
+        st.info(
+            "Não há Follow para datas atuais ou futuras."
+        )
+        return
 
-        for _, row in pendentes.sort_values("data_dt").iterrows():
-            follow = row.to_dict()
-            data_txt = pd.to_datetime(
-                follow["data_manutencao"]
-            ).strftime("%d/%m/%Y")
-            qtd = int(follow.get("qtd_agendadas") or 0)
+    st.markdown("#### Pendências para confirmação")
 
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([2, 1, 1])
-                c1.markdown(f"#### {data_txt}")
-                c1.caption(
-                    f"{qtd} manutenção(ões) prevista(s)"
-                )
-                c2.metric(
-                    "Status",
-                    str(follow.get("status") or "Preparado"),
-                )
-                status_resposta_valor = follow.get("status_resposta")
-                status_resposta_txt = (
-                    str(status_resposta_valor).strip()
-                    if pd.notna(status_resposta_valor)
-                    and str(status_resposta_valor).strip().lower()
-                    not in ("", "nan", "none", "nat")
-                    else "Pendente"
-                )
+    planejamento = carregar_planejamento_futuro_portal()
 
-                c3.metric(
-                    "Resposta",
-                    status_resposta_txt,
-                )
+    for _, row in pendentes.sort_values(
+        "data_dt"
+    ).iterrows():
+        follow = row.to_dict()
 
-                os_lista = [
-                    str(x)
-                    for x in (follow.get("os_agendadas") or [])
-                    if str(x).strip()
-                ]
+        data_txt = pd.to_datetime(
+            follow["data_manutencao"]
+        ).strftime("%d/%m/%Y")
 
-                if os_lista:
-                    st.markdown("**OS previstas para confirmação**")
+        os_lista = [
+            texto_limpo(x)
+            for x in (
+                follow.get("os_agendadas")
+                or []
+            )
+            if texto_limpo(x)
+        ]
 
-                    # Busca detalhes do planejamento futuro para exibir
-                    # cada OS separadamente, preservando o Follow diário.
-                    detalhes_os = carregar_planejamento_futuro_portal()
+        respostas = carregar_respostas_os_follow(
+            int(follow["id"])
+        )
 
-                    if not detalhes_os.empty:
-                        detalhes_os = detalhes_os[
-                            detalhes_os["OS"]
-                            .astype(str)
-                            .isin(os_lista)
-                        ].copy()
+        respondidas = set()
 
-                    if not detalhes_os.empty:
-                        colunas_follow = [
-                            "OS",
-                            "Cliente",
-                            "Local",
-                            "Tipo de Serviço",
-                            "Status",
-                        ]
-                        colunas_follow = [
-                            c
-                            for c in colunas_follow
-                            if c in detalhes_os.columns
-                        ]
+        if not respostas.empty:
+            respondidas = set(
+                respostas["os_numero"]
+                .fillna("")
+                .astype(str)
+            )
 
-                        st.dataframe(
-                            detalhes_os[colunas_follow]
-                            .drop_duplicates(
-                                subset=["OS"]
-                            )
-                            .sort_values("OS"),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                    else:
-                        st.dataframe(
-                            pd.DataFrame(
-                                {"OS": os_lista}
-                            ),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+        total = len(os_lista)
+        total_respondidas = len(
+            [
+                os_numero
+                for os_numero in os_lista
+                if os_numero in respondidas
+            ]
+        )
 
-                respondido_em = follow.get("respondido_em")
-                ja_respondido = (
-                    pd.notna(respondido_em)
-                    and str(respondido_em).strip().lower()
-                    not in ("", "nan", "none", "nat")
-                )
-
-                if ja_respondido:
-                    resposta = carregar_resposta_follow_portal(
-                        int(follow["id"])
+        total_impedimentos = 0
+        if not respostas.empty:
+            total_impedimentos = int(
+                respostas[
+                    (
+                        respostas["os_numero"]
+                        .astype(str)
+                        .isin(os_lista)
                     )
-
-                    tem_impedimento_valor = follow.get("tem_impedimento")
-                    tem_impedimento_registrado = (
-                        pd.notna(tem_impedimento_valor)
-                        and bool(tem_impedimento_valor)
+                    & (
+                        respostas[
+                            "tem_impedimento"
+                        ] == True
                     )
+                ]["os_numero"]
+                .nunique()
+            )
 
-                    if tem_impedimento_registrado:
-                        st.warning(
-                            "⚠️ Follow respondido com impedimento."
-                        )
-                    else:
-                        st.success(
-                            "✅ Follow respondido sem impedimento."
-                        )
+        sem_resposta = max(
+            total - total_respondidas,
+            0,
+        )
 
-                    if resposta:
-                        nome = str(
-                            resposta.get("nome_respondente") or ""
-                        )
-                        motivos = resposta.get("motivos") or []
-                        observacao = str(
-                            resposta.get("observacao") or ""
-                        )
+        with st.container(border=True):
+            st.markdown(
+                f"### Follow • {data_txt}"
+            )
 
-                        if nome:
-                            st.write(
-                                f"**Respondente:** {nome}"
-                            )
-                        if motivos:
-                            st.write(
-                                "**Motivos:** "
-                                + " | ".join(map(str, motivos))
-                            )
-                        if observacao:
-                            st.write(
-                                f"**Observação:** {observacao}"
-                            )
-                    continue
+            r1, r2, r3, r4 = st.columns(
+                4
+            )
+            r1.metric(
+                "OS previstas",
+                total,
+            )
+            r2.metric(
+                "Confirmadas",
+                total_respondidas,
+            )
+            r3.metric(
+                "Com impedimento",
+                total_impedimentos,
+            )
+            r4.metric(
+                "Sem resposta",
+                sem_resposta,
+            )
 
-                with st.form(
-                    f"follow_portal_{int(follow['id'])}"
-                ):
-                    nome = st.text_input(
-                        "Seu nome",
-                        key=f"nome_{follow['id']}",
+            if sem_resposta == 0 and total > 0:
+                if total_impedimentos:
+                    st.warning(
+                        "⚠️ Follow concluído com impedimento(s)."
                     )
-
-                    equipamentos = st.radio(
-                        "Todos os equipamentos/ferramentas estão disponíveis?",
-                        ["Sim", "Não"],
-                        horizontal=True,
-                        key=f"equip_{follow['id']}",
-                    )
-
-                    veiculo = st.radio(
-                        "O(s) veículo(s) estará(ão) disponível(is)?",
-                        ["Sim", "Não", "Não sei"],
-                        horizontal=True,
-                        key=f"veic_{follow['id']}",
-                    )
-
-                    capacidade = st.radio(
-                        "A oficina possui técnico/capacidade para atender?",
-                        ["Sim", "Não"],
-                        horizontal=True,
-                        key=f"cap_{follow['id']}",
-                    )
-
-                    impedimento = st.radio(
-                        "Existe algum impedimento para a execução?",
-                        [
-                            "Não, está tudo OK",
-                            "Sim, existe impedimento",
-                        ],
-                        key=f"imp_{follow['id']}",
-                    )
-
-                    tem_impedimento = (
-                        impedimento == "Sim, existe impedimento"
-                    )
-
-                    motivos = []
-                    os_afetadas = []
-                    observacao = ""
-                    previsao = ""
-
-                    if tem_impedimento:
-                        motivos = st.multiselect(
-                            "Qual(is) o(s) impedimento(s)?",
-                            MOTIVOS_IMPEDIMENTO_PORTAL,
-                            key=f"motivos_{follow['id']}",
-                        )
-
-                        if os_lista:
-                            os_afetadas = st.multiselect(
-                                "Quais OS podem ser afetadas?",
-                                os_lista,
-                                key=f"osafet_{follow['id']}",
-                            )
-
-                        observacao = st.text_area(
-                            "Explique o impedimento",
-                            key=f"obs_{follow['id']}",
-                        )
-
-                        previsao = st.text_input(
-                            "Previsão de solução (opcional)",
-                            key=f"prev_{follow['id']}",
-                        )
-                    else:
-                        observacao = st.text_area(
-                            "Observação (opcional)",
-                            key=f"obsok_{follow['id']}",
-                        )
-
-                    enviar = st.form_submit_button(
-                        "Enviar confirmação",
-                        type="primary",
-                        use_container_width=True,
-                    )
-
-                if enviar:
-                    if not nome.strip():
-                        st.error("Informe seu nome.")
-                        return
-
-                    if tem_impedimento and not motivos:
-                        st.error(
-                            "Selecione ao menos um motivo."
-                        )
-                        return
-
-                    enviar_resposta_follow_portal(
-                        follow=follow,
-                        nome_respondente=nome,
-                        equipamentos=equipamentos,
-                        veiculo=veiculo,
-                        capacidade=capacidade,
-                        tem_impedimento=tem_impedimento,
-                        motivos=motivos,
-                        os_afetadas=os_afetadas,
-                        observacao=observacao,
-                        previsao=previsao,
-                    )
-
+                else:
                     st.success(
-                        "Resposta enviada para a gestão."
+                        "✅ Follow concluído. Todas as OS estão confirmadas."
+                    )
+            else:
+                st.warning(
+                    f"⚠️ Ainda existem {sem_resposta} OS "
+                    "aguardando confirmação."
+                )
+
+            st.markdown(
+                "#### Confirmação rápida"
+            )
+
+            nome_lote = st.text_input(
+                "Seu nome para confirmação em lote",
+                key=f"nome_lote_{follow['id']}",
+            )
+
+            if st.button(
+                "✅ Confirmar todas as OS como OK",
+                key=f"confirmar_todas_{follow['id']}",
+                use_container_width=True,
+            ):
+                if not nome_lote.strip():
+                    st.error(
+                        "Informe seu nome antes de confirmar."
+                    )
+                elif not os_lista:
+                    st.error(
+                        "Nenhuma OS disponível para confirmação."
+                    )
+                else:
+                    confirmar_todas_os_ok(
+                        follow=follow,
+                        os_lista=os_lista,
+                        nome_respondente=nome_lote,
+                    )
+                    st.success(
+                        "Todas as OS foram confirmadas como OK."
                     )
                     st.rerun()
 
+            st.divider()
+            st.markdown(
+                "#### Resposta individual por OS"
+            )
+
+            for os_numero in os_lista:
+                detalhe_os = pd.DataFrame()
+
+                if not planejamento.empty:
+                    detalhe_os = planejamento[
+                        planejamento["OS"]
+                        .astype(str)
+                        == str(os_numero)
+                    ].copy()
+
+                cliente_nome = ""
+                local = ""
+                tipo = "Manutenção"
+                status_os = "Pendente"
+
+                if not detalhe_os.empty:
+                    item = detalhe_os.iloc[0]
+                    cliente_nome = texto_limpo(
+                        item.get("Cliente", "")
+                    )
+                    local = texto_limpo(
+                        item.get("Local", "")
+                    )
+                    tipo = (
+                        texto_limpo(
+                            item.get(
+                                "Tipo de Serviço",
+                                "",
+                            )
+                        )
+                        or tipo
+                    )
+                    status_os = (
+                        texto_limpo(
+                            item.get(
+                                "Status",
+                                "",
+                            )
+                        )
+                        or status_os
+                    )
+
+                resposta_os = {}
+
+                if not respostas.empty:
+                    achado = respostas[
+                        respostas["os_numero"]
+                        .astype(str)
+                        == str(os_numero)
+                    ]
+
+                    if not achado.empty:
+                        resposta_os = (
+                            achado.iloc[-1]
+                            .to_dict()
+                        )
+
+                respondida = bool(
+                    resposta_os
+                )
+
+                titulo_status = (
+                    "⚠️ Com impedimento"
+                    if (
+                        respondida
+                        and bool(
+                            resposta_os.get(
+                                "tem_impedimento",
+                                False,
+                            )
+                        )
+                    )
+                    else (
+                        "✅ Tudo OK"
+                        if respondida
+                        else "🔴 Aguardando resposta"
+                    )
+                )
+
+                with st.expander(
+                    f"{os_numero} • {titulo_status}",
+                    expanded=not respondida,
+                ):
+                    d1, d2 = st.columns(2)
+
+                    with d1:
+                        st.write(
+                            f"**Cliente:** "
+                            f"{cliente_nome or 'Não informado'}"
+                        )
+                        st.write(
+                            f"**Tipo:** {tipo}"
+                        )
+
+                    with d2:
+                        st.write(
+                            f"**Local:** "
+                            f"{local or 'Não informado'}"
+                        )
+                        st.write(
+                            f"**Status OFS:** {status_os}"
+                        )
+
+                    if respondida:
+                        if bool(
+                            resposta_os.get(
+                                "tem_impedimento",
+                                False,
+                            )
+                        ):
+                            st.warning(
+                                "Esta OS foi confirmada com impedimento."
+                            )
+                        else:
+                            st.success(
+                                "Esta OS foi confirmada sem impedimento."
+                            )
+
+                        respondente = texto_limpo(
+                            resposta_os.get(
+                                "nome_respondente",
+                                "",
+                            )
+                        )
+                        if respondente:
+                            st.caption(
+                                f"Respondido por {respondente}"
+                            )
+
+                        motivos_resp = (
+                            resposta_os.get("motivos")
+                            or []
+                        )
+                        if motivos_resp:
+                            st.write(
+                                "**Motivo(s):** "
+                                + " | ".join(
+                                    map(
+                                        str,
+                                        motivos_resp,
+                                    )
+                                )
+                            )
+
+                        obs_resp = texto_limpo(
+                            resposta_os.get(
+                                "observacao",
+                                "",
+                            )
+                        )
+                        if obs_resp:
+                            st.write(
+                                f"**Observação:** "
+                                f"{obs_resp}"
+                            )
+
+                        if st.button(
+                            "✏️ Alterar resposta desta OS",
+                            key=(
+                                f"editar_os_"
+                                f"{follow['id']}_"
+                                f"{os_numero}"
+                            ),
+                        ):
+                            st.session_state[
+                                f"editar_follow_os_"
+                                f"{follow['id']}_"
+                                f"{os_numero}"
+                            ] = True
+                            st.rerun()
+
+                    editar = (
+                        not respondida
+                        or st.session_state.get(
+                            f"editar_follow_os_"
+                            f"{follow['id']}_"
+                            f"{os_numero}",
+                            False,
+                        )
+                    )
+
+                    if editar:
+                        with st.form(
+                            f"form_os_"
+                            f"{follow['id']}_"
+                            f"{os_numero}"
+                        ):
+                            nome = st.text_input(
+                                "Seu nome",
+                                value=texto_limpo(
+                                    resposta_os.get(
+                                        "nome_respondente",
+                                        "",
+                                    )
+                                )
+                                if respondida
+                                else "",
+                            )
+
+                            situacao = st.radio(
+                                "Situação desta OS",
+                                [
+                                    "✅ Tudo OK",
+                                    "⚠️ Tenho impedimento",
+                                ],
+                                index=(
+                                    1
+                                    if (
+                                        respondida
+                                        and bool(
+                                            resposta_os.get(
+                                                "tem_impedimento",
+                                                False,
+                                            )
+                                        )
+                                    )
+                                    else 0
+                                ),
+                                horizontal=True,
+                            )
+
+                            tem_impedimento = (
+                                situacao
+                                == "⚠️ Tenho impedimento"
+                            )
+
+                            equipamentos = st.radio(
+                                "Equipamentos/ferramentas disponíveis?",
+                                ["Sim", "Não"],
+                                horizontal=True,
+                                index=(
+                                    0
+                                    if (
+                                        not respondida
+                                        or bool(
+                                            resposta_os.get(
+                                                "equipamentos_ok",
+                                                True,
+                                            )
+                                        )
+                                    )
+                                    else 1
+                                ),
+                            )
+
+                            veiculo_opcoes = [
+                                "Sim",
+                                "Não",
+                                "Não sei",
+                            ]
+                            veiculo_atual = texto_limpo(
+                                resposta_os.get(
+                                    "veiculo_disponivel",
+                                    "Sim",
+                                )
+                            )
+                            if (
+                                veiculo_atual
+                                not in veiculo_opcoes
+                            ):
+                                veiculo_atual = "Sim"
+
+                            veiculo = st.radio(
+                                "Veículo disponível?",
+                                veiculo_opcoes,
+                                horizontal=True,
+                                index=veiculo_opcoes.index(
+                                    veiculo_atual
+                                ),
+                            )
+
+                            capacidade = st.radio(
+                                "Capacidade/técnico disponível?",
+                                ["Sim", "Não"],
+                                horizontal=True,
+                                index=(
+                                    0
+                                    if (
+                                        not respondida
+                                        or bool(
+                                            resposta_os.get(
+                                                "capacidade_ok",
+                                                True,
+                                            )
+                                        )
+                                    )
+                                    else 1
+                                ),
+                            )
+
+                            motivos = []
+                            observacao = ""
+                            previsao = ""
+
+                            if tem_impedimento:
+                                motivos = st.multiselect(
+                                    "Qual(is) o(s) impedimento(s)?",
+                                    MOTIVOS_IMPEDIMENTO_PORTAL,
+                                    default=(
+                                        resposta_os.get(
+                                            "motivos"
+                                        )
+                                        or []
+                                    )
+                                    if respondida
+                                    else [],
+                                )
+
+                                observacao = st.text_area(
+                                    "Explique o impedimento",
+                                    value=texto_limpo(
+                                        resposta_os.get(
+                                            "observacao",
+                                            "",
+                                        )
+                                    )
+                                    if respondida
+                                    else "",
+                                )
+
+                                previsao = st.text_input(
+                                    "Previsão de solução",
+                                    value=texto_limpo(
+                                        resposta_os.get(
+                                            "previsao_solucao",
+                                            "",
+                                        )
+                                    )
+                                    if respondida
+                                    else "",
+                                )
+                            else:
+                                observacao = st.text_area(
+                                    "Observação (opcional)",
+                                    value=texto_limpo(
+                                        resposta_os.get(
+                                            "observacao",
+                                            "",
+                                        )
+                                    )
+                                    if respondida
+                                    else "",
+                                )
+
+                            salvar = (
+                                st.form_submit_button(
+                                    "💾 Salvar resposta desta OS",
+                                    type="primary",
+                                    use_container_width=True,
+                                )
+                            )
+
+                        if salvar:
+                            if not nome.strip():
+                                st.error(
+                                    "Informe seu nome."
+                                )
+                            elif (
+                                tem_impedimento
+                                and not motivos
+                            ):
+                                st.error(
+                                    "Selecione ao menos um motivo."
+                                )
+                            else:
+                                salvar_resposta_os_follow(
+                                    follow=follow,
+                                    os_numero=os_numero,
+                                    nome_respondente=nome,
+                                    equipamentos=equipamentos,
+                                    veiculo=veiculo,
+                                    capacidade=capacidade,
+                                    tem_impedimento=tem_impedimento,
+                                    motivos=motivos,
+                                    observacao=observacao,
+                                    previsao=previsao,
+                                )
+
+                                st.session_state.pop(
+                                    f"editar_follow_os_"
+                                    f"{follow['id']}_"
+                                    f"{os_numero}",
+                                    None,
+                                )
+
+                                st.success(
+                                    f"Resposta da OS {os_numero} salva."
+                                )
+                                st.rerun()
+
     st.divider()
-    st.markdown("#### Histórico recente")
+    st.markdown(
+        "#### Histórico recente de Follow"
+    )
 
     historico = follows[
-        follows["respondido_em"].notna()
-        & ~follows["respondido_em"].astype(str).str.strip().str.lower().isin(
-            ["", "nan", "none", "nat"]
+        follows["status"]
+        .fillna("")
+        .astype(str)
+        .isin(
+            [
+                "Parcial",
+                "Respondido",
+            ]
         )
     ].copy()
 
     if historico.empty:
-        st.caption("Nenhuma resposta registrada ainda.")
+        st.caption(
+            "Nenhuma resposta registrada ainda."
+        )
     else:
         cols = [
             c
             for c in [
                 "data_manutencao",
                 "qtd_agendadas",
+                "status",
                 "status_resposta",
-                "respondido_em",
+                "ultima_atualizacao",
             ]
             if c in historico.columns
         ]
 
         st.dataframe(
-            historico[cols].sort_values(
+            historico[cols]
+            .sort_values(
                 "data_manutencao",
                 ascending=False,
             ),
             use_container_width=True,
             hide_index=True,
         )
-
-
 
 def calcular_indicadores_portal_todos_servicos(
     conciliacao: pd.DataFrame,
@@ -3034,7 +3640,7 @@ with st.sidebar:
     st.caption("Oficina vinculada")
     st.success(OFICINA_PORTAL)
     st.divider()
-    st.caption("Portal da Oficina • MVP 1.3.2")
+    st.caption("Portal da Oficina • MVP 1.4.0")
 
 if isinstance(periodo, (tuple, list)) and len(periodo) == 2:
     inicio, fim = periodo
